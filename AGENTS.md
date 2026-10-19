@@ -52,3 +52,17 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
   - Guest `System.getProperty` reads `j2meProps`; the JL-Modern adapter
     mirrors the whole host property table (profile `SystemProperties`
     included), matching what dex-path guests see.
+  - `pop2` (0x58) dropped only ONE slot for two category-1 values — the
+    `WIDE`-conditional second pop was wrong (pop2 always consumes two slots).
+    Obfuscators emit `getstatic arr; arraylength; pop2` inside argument
+    lists; the residue shifted every following arg one slot (`Lbx;` params
+    arrived as Integer 0 → `invokevirtual` fell into host dispatch →
+    "host class missing bx", thread death → frozen screen). Tests:
+    `pop2TwoSingles` (hand-assembled residue-shifts-args shape),
+    `pop2WidePair`.
+  - Diagnostic: when `invokevirtual`/`invokeinterface` sees a non-VmObject
+    receiver but the declared owner is a **guest** class (verifier-typed
+    slot, so always a VM bug), the interpreter dumps recv type + frame
+    locals + operand stack + the whole guest frame chain to stderr before
+    host dispatch would mask it as "host class missing". This is how the
+    pop2 corruption was localized to `c.l.b`'s locals in one shot.
