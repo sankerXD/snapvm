@@ -167,6 +167,14 @@ public final class Interpreter {
 			if (recv == null)
 				throw new VmException(new NullPointerException());
 			if (owner.host) {
+				if (r.name.equals("<init>") && recv instanceof VmObject) {
+					// host superclass constructor: manifests the adapter shadow
+					// (its own ctor runs the real host super-ctor)
+					popToArray(f, r.desc, true);
+					vm.constructShadow((VmObject) recv, owner);
+					f.pc = pc + oplen;
+					return;
+				}
 				Object[] args = popToArray(f, r.desc, true);
 				Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 2);
 				f.pc = pc + oplen;
@@ -195,9 +203,11 @@ public final class Interpreter {
 		if (m != null && m.code == null)
 			throw new VmException(new AbstractMethodError(rc.name + "." + r.name));
 		if (m == null) {
-			// falls back to a host-root method (Object.*) not overridden
+			// falls back to a host method (superclass boundary or Object.*) not overridden
+			VmClass hb = rc.hostBoundary();
 			Object[] args = popToArray(f, r.desc, true);
-			Object ret = vm.bridge.call(t, "java/lang/Object", r.name, r.desc, args, 0);
+			Object ret = vm.bridge.call(t, hb != null ? hb.name : "java/lang/Object",
+					r.name, r.desc, args, 0);
 			f.pc = pc + oplen;
 			pushRet(f, r.desc, ret);
 			return;

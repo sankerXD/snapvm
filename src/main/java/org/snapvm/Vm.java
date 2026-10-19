@@ -37,8 +37,9 @@ public final class Vm {
 
 	private final List<ClassSource> sources = new ArrayList<>();
 	private final List<VmThread> threads = new ArrayList<>();
-	private final ArrayDeque<Runnable> hostCalls = new ArrayDeque<>(); // host->guest pending upcalls
+	private final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
 	private final Object lock = new Object();
+	private final Object execLock = new Object(); // serializes all guest execution
 	final IdentityHashMap<Thread, VmThread> greenThreads = new IdentityHashMap<>();
 	private VmThread executor;
 	private Thread executorThread;
@@ -199,31 +200,22 @@ public final class Vm {
 
 	/** run the scheduler until idle or budget (total instructions) exhausted. */
 	public void pump(long budget) {
-		Thread prev = executorThread;
-		executorThread = Thread.currentThread();
-		long used = 0;
-		for (;;) {
-			VmThread t = nextRunnable();
-			if (t == null)
-				break;
-			executor = t;
-			long q = budget > 0 ? Math.max(1, budget - used) : Long.MAX_VALUE;
-			used += Interpreter.execute(this, t, q);
-			executor = null;
-			if (budget > 0 && used >= budget)
-				break;
-		}
-		executorThread = prev;
-		// drain host->guest upcalls issued while we were running
-		Runnable r;
-		synchronized (lock) {
-			r = hostCalls.poll();
-		}
-		while (r != null) {
-			r.run();
-			synchronized (lock) {
-				r = hostCalls.poll();
+		synchronized (execLock) {
+			Thread prev = executorThread;
+			executorThread = Thread.currentThread();
+			long used = 0;
+			for (;;) {
+				VmThread t = nextRunnable();
+				if (t == null)
+					break;
+				executor = t;
+				long q = budget > 0 ? Math.max(1, budget - used) : Long.MAX_VALUE;
+				used += Interpreter.execute(this, t, q);
+				executor = null;
+				if (budget > 0 && used >= budget)
+					break;
 			}
+			executorThread = prev;
 		}
 	}
 
@@ -344,6 +336,26 @@ public final class Vm {
 		return t.result;
 	}
 
+	/**
+	 * Allocate a guest object and run its no-arg {@code <init>}. Runs on the
+	 * calling thread; for guest classes extending host classes the adapter
+	 * shadow (if registered) is attached automatically.
+	 */
+	public VmObject newGuestObject(String className) {
+		VmClass c = resolveClass(className);
+		if (c.host)
+			throw new VmError("not a guest class: " + className);
+		VmThread t = newThread();
+		t.hostThread = Thread.currentThread();
+		ensureInitBlocking(c, t);
+		VmObject o = new VmObject(c);
+		pushInvoke(t, o, "<init>", "()V", new Object[]{o});
+		runUntilDone(t);
+		if (t.lastError != null)
+			throw t.lastError;
+		return o;
+	}
+
 	public Object invokeVirtual(Object recv, String name, String desc, Object... args) {
 		VmThread t = newThread();
 		t.hostThread = Thread.currentThread();
@@ -398,7 +410,9 @@ public final class Vm {
 			owner = ((VmObject) recv).clazz;
 			m = owner.findMethod(name, desc);
 			if (m == null) {
-				Object r = bridge.call(t, "java/lang/Object", name, desc, args, 0);
+				VmClass hb = owner.hostBoundary();
+				Object r = bridge.call(t, hb != null ? hb.name : "java/lang/Object",
+						name, desc, args, 0);
 				t.nestedResult = r;
 				t.result = r;
 				if (t.frames.isEmpty())
@@ -439,13 +453,17 @@ public final class Vm {
 			if (c == 'L')
 				i = desc.indexOf(';', i);
 			Object v = args[ai++];
-			f.locals[li++] = v;
+			f.locals[li++] = fromHost(v);
 			if (c == 'J' || c == 'D')
 				f.locals[li++] = Frame.WIDE;
 		}
 	}
 
-	/** host->guest call; safe to invoke from any host thread (blocks until VM runs it). */
+	/**
+	 * host->guest call; safe to invoke from any host thread. On the executor thread
+	 * it nests into the current guest stack; from any other thread it waits for the
+	 * single-executor gate and runs the call on this thread.
+	 */
 	public Object callFromHost(final Object recv, final String name, final String desc,
 			final Object... args) {
 		if (Thread.currentThread() == executorThread) {
@@ -459,36 +477,15 @@ public final class Vm {
 			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
 			return cur.nestedResult;
 		}
-		final Object[] box = new Object[1];
-		final RuntimeException[] err = new RuntimeException[1];
-		final boolean[] done = {false};
-		synchronized (lock) {
-			hostCalls.add(() -> {
-				VmThread t = newThread();
-				t.hostThread = Thread.currentThread();
-				try {
-					pushInvoke(t, recv, name, desc, joinArgs(recv, args));
-					runUntilDone(t);
-					box[0] = t.result;
-					err[0] = t.lastError;
-				} finally {
-					synchronized (done) {
-						done[0] = true;
-						done.notifyAll();
-					}
-				}
-			});
+		synchronized (execLock) {
+			VmThread t = newThread();
+			t.hostThread = Thread.currentThread();
+			pushInvoke(t, recv, name, desc, joinArgs(recv, args));
+			runUntilDone(t);
+			if (t.lastError != null)
+				throw t.lastError;
+			return t.result;
 		}
-		synchronized (done) {
-			while (!done[0])
-				try {
-					done.wait();
-				} catch (InterruptedException ignored) {
-				}
-		}
-		if (err[0] != null)
-			throw err[0];
-		return box[0];
 	}
 
 	private static Object[] joinArgs(Object recv, Object[] args) {
@@ -570,6 +567,57 @@ public final class Vm {
 	void greenSleep(VmThread t, long ms) {
 		t.state = VmThread.TIMED_WAITING;
 		t.wakeTime = System.currentTimeMillis() + ms;
+	}
+
+	// ---------- host-shadow support (guest class extends host class) ----------
+
+	/** Adapter registers a factory producing a real host object per guest instance. */
+	public interface ShadowFactory {
+		Object create(Vm vm, VmObject guest);
+	}
+
+	public void registerShadow(Class<?> hostBase, ShadowFactory f) {
+		shadowFactories.put(hostBase, f);
+	}
+
+	/**
+	 * Called when guest code runs {@code invokespecial <init>} on a host
+	 * superclass: manifests the shadow object, whose own construction runs the
+	 * real host constructor. No-op if the shadow already exists or no factory
+	 * is registered (super-ctor effects are then skipped).
+	 */
+	void constructShadow(VmObject guest, VmClass hostBoundary) {
+		if (guest.hostShadow != null)
+			return;
+		ShadowFactory f = shadowFactories.get(hostBoundary.hostClass);
+		if (f != null)
+			guest.hostShadow = f.create(this, guest);
+	}
+
+	/** marshal-side variant: the shadow is required, throw if it can't exist. */
+	Object requireShadow(VmObject guest, Class<?> target) {
+		if (guest.hostShadow != null && target.isInstance(guest.hostShadow))
+			return guest.hostShadow;
+		VmClass hb = guest.clazz.hostBoundary();
+		if (hb == null || !target.isAssignableFrom(hb.hostClass))
+			throw new VmError("cannot marshal " + guest.clazz.name + " to " + target.getName());
+		constructShadow(guest, hb);
+		if (guest.hostShadow == null)
+			throw new VmError("no shadow factory registered for " + hb.name);
+		return guest.hostShadow;
+	}
+
+	/** host -> guest: unwrap shadows; normalize int-family primitives to Integer. */
+	static Object fromHost(Object v) {
+		if (v instanceof GuestShadow)
+			return ((GuestShadow) v).guest();
+		if (v instanceof Boolean)
+			return (Boolean) v ? 1 : 0;
+		if (v instanceof Character)
+			return (int) (Character) v;
+		if (v instanceof Byte || v instanceof Short)
+			return ((Number) v).intValue();
+		return v;
 	}
 
 	void park(VmThread t, long ms) {

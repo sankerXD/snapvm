@@ -24,6 +24,7 @@ public final class VmClass {
 	int instanceSlotCount;
 	Object[] statics;
 	Map<String, Integer> fieldSlots;            // own instance fields: name+desc -> global slot idx
+	Object[] fieldDefaults;                     // per-slot JVM default (0/false/null), copied per instance
 	final Map<String, ClassFile.Method> declaredMethods = new HashMap<>();
 	final Map<String, ClassFile.Method> methodMap = new HashMap<>(); // merged virtual dispatch
 	Map<String, Integer> staticFieldSlots;      // own statics: name+desc -> idx into this.statics
@@ -91,9 +92,9 @@ public final class VmClass {
 			return false;
 		}
 		if (host) {
-			// host target, guest source: only java.lang.Object works (handled above), or when the
-			// guest class is a shadowed subclass (M2, hostShadow != null)
-			return false;
+			// host target vs guest source: the guest's class chain may cross into a host
+			// superclass or implement a host interface — walk and compare host classes
+			return hostAssignable(other);
 		}
 		// both guest
 		for (VmClass c = other; c != null; c = c.superClass) {
@@ -107,6 +108,27 @@ public final class VmClass {
 		if (other.isArray() && (name.equals("java/lang/Cloneable") || name.equals("java/io/Serializable")))
 			return true;
 		return false;
+	}
+
+	/** this (host) <- other: true if other's chain reaches a host class assignable to this. */
+	private boolean hostAssignable(VmClass other) {
+		for (VmClass c = other; c != null; c = c.superClass) {
+			if (c.host)
+				return hostClass.isAssignableFrom(c.hostClass);
+			if (c.interfaces != null)
+				for (VmClass i : c.interfaces)
+					if (i != null && hostAssignable(i))
+						return true;
+		}
+		return false;
+	}
+
+	/** first host class on this class's extends chain, or null if purely guest-rooted. */
+	VmClass hostBoundary() {
+		VmClass c = this;
+		while (c != null && !c.host)
+			c = c.superClass;
+		return c;
 	}
 
 	/** runtime instanceof for a concrete object reference. */
@@ -143,9 +165,6 @@ public final class VmClass {
 			superClass = vm.resolveClass(cf.superName);
 		else if (!name.equals("java/lang/Object"))
 			superClass = vm.resolveClass("java/lang/Object");
-		if (superClass != null && superClass.host && !superClass.name.equals("java/lang/Object"))
-			throw new VmError("guest class " + name + " extends host class " + superClass.name
-					+ " (needs shadow-object support, M2)");
 		if (cf.interfaces != null) {
 			interfaces = new VmClass[cf.interfaces.length];
 			for (int i = 0; i < cf.interfaces.length; i++)
@@ -185,7 +204,32 @@ public final class VmClass {
 				methodMap.put(m.name + "|" + m.desc, m);
 		}
 		instanceSlotCount = inst;
+		fieldDefaults = new Object[inst];
+		for (Map.Entry<String, Integer> e : fieldSlots.entrySet())
+			fieldDefaults[e.getValue()] = defaultValue(e.getKey());
 		statics = new Object[stat];
+		for (Map.Entry<String, Integer> e : staticFieldSlots.entrySet())
+			statics[e.getValue()] = defaultValue(e.getKey());
+	}
+
+	/** JVM default value for a field type; desc arrives as "name|desc". */
+	private static Object defaultValue(String nameAndDesc) {
+		switch (nameAndDesc.charAt(nameAndDesc.lastIndexOf('|') + 1)) {
+		case 'Z':
+		case 'B':
+		case 'S':
+		case 'C':
+		case 'I':
+			return 0;
+		case 'J':
+			return 0L;
+		case 'F':
+			return 0f;
+		case 'D':
+			return 0d;
+		default:
+			return null;
+		}
 	}
 
 	static boolean isWide(String desc) {

@@ -38,13 +38,28 @@ final class HostBridge {
 	Object toHost(Object v, Class<?> param) {
 		if (v == null)
 			return null;
+		if (v instanceof Integer && param.isPrimitive() && param != int.class) {
+			int i = (Integer) v;
+			if (param == boolean.class) return i != 0;
+			if (param == byte.class) return (byte) i;
+			if (param == short.class) return (short) i;
+			if (param == char.class) return (char) i;
+			if (param == long.class) return (long) i;
+			if (param == float.class) return (float) i;
+			if (param == double.class) return (double) i;
+		}
 		if (v instanceof VmObject) {
 			if (param == Object.class)
 				return v;
+			VmObject g = (VmObject) v;
+			if (g.hostShadow != null && param.isInstance(g.hostShadow))
+				return g.hostShadow;
 			if (param.isInterface())
-				return proxyFor((VmObject) v, param);
-			throw new VmError("cannot marshal guest object to " + param.getName());
+				return proxyFor(g, param);
+			return vm.requireShadow(g, param);
 		}
+		if (v instanceof GuestShadow)
+			return ((GuestShadow) v).guest(); // shouldn't happen inbound; keep symmetric
 		if (v instanceof GuestClass) {
 			if (param == Class.class) {
 				VmClass gc = ((GuestClass) v).vmClass();
@@ -57,13 +72,16 @@ final class HostBridge {
 		return v;
 	}
 
-	private Object proxyFor(final VmObject guest, Class<?> iface) {
+	private Object proxyFor(final VmObject guest, final Class<?> iface) {
 		Object p = Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
 				new InvocationHandler() {
 					public Object invoke(Object proxy, Method method, Object[] args) {
-						Object cached = vm.proxies.get(proxy);
-						return vm.callFromHost(guest, method.getName(),
-								descOf(method), args == null ? new Object[0] : args);
+						Object[] in = args == null ? new Object[0] : args.clone();
+						for (int i = 0; i < in.length; i++)
+							in[i] = Vm.fromHost(in[i]);
+						Object r = vm.callFromHost(guest, method.getName(),
+								descOf(method), in);
+						return toHost(r, method.getReturnType());
 					}
 				});
 		vm.proxies.put(p, guest);
@@ -201,9 +219,9 @@ final class HostBridge {
 				return c.newInstance(margs);
 			}
 			Method m = findMethod(hc, name, desc, kind == 1);
-			Object recv = kind == 1 ? null : args[0];
+			Object recv = kind == 1 ? null : toHost(args[0], hc);
 			Object[] margs = marshalArgs(m, args, kind == 1 ? 0 : 1);
-			return m.invoke(recv, margs);
+			return Vm.fromHost(m.invoke(recv, margs));
 		} catch (InvocationTargetException e) {
 			throw new VmException(e.getCause());
 		} catch (IllegalAccessException | InstantiationException | IllegalArgumentException e) {
@@ -438,7 +456,7 @@ final class HostBridge {
 	Object getStaticField(VmClass owner, ClassFile.Ref r) {
 		Field f = findField(owner.hostClass, r.name, r.desc, true);
 		try {
-			return f.get(null);
+			return Vm.fromHost(f.get(null));
 		} catch (IllegalAccessException e) {
 			throw new VmError("getfield " + r.name, e);
 		}
@@ -454,18 +472,24 @@ final class HostBridge {
 	}
 
 	Object getField(Object recv, ClassFile.Ref r) {
-		Field f = findField(recv.getClass(), r.name, r.desc, false);
+		Object target = recv instanceof VmObject ? ((VmObject) recv).hostShadow : recv;
+		if (target == null)
+			throw new VmException(new NoSuchFieldError(r.name + " (no host shadow)"));
+		Field f = findField(target.getClass(), r.name, r.desc, false);
 		try {
-			return f.get(recv);
+			return Vm.fromHost(f.get(target));
 		} catch (IllegalAccessException e) {
 			throw new VmError("getfield " + r.name, e);
 		}
 	}
 
 	void putField(Object recv, ClassFile.Ref r, Object v) {
-		Field f = findField(recv.getClass(), r.name, r.desc, false);
+		Object target = recv instanceof VmObject ? ((VmObject) recv).hostShadow : recv;
+		if (target == null)
+			throw new VmException(new NoSuchFieldError(r.name + " (no host shadow)"));
+		Field f = findField(target.getClass(), r.name, r.desc, false);
 		try {
-			f.set(recv, toHost(v, f.getType()));
+			f.set(target, toHost(v, f.getType()));
 		} catch (IllegalAccessException e) {
 			throw new VmError("putfield " + r.name, e);
 		}

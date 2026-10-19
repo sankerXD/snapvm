@@ -178,6 +178,65 @@ public class InterpreterTest {
 		assertEquals(12, run(vm, "Ci", "go"));
 	}
 
+	/**
+	 * The M3 boundary spike: a guest midlet extending a HOST abstract class,
+	 * driven by host-side lifecycle calls, with guest->host API calls and a
+	 * host-interface callback (CommandListener) fired back into the guest.
+	 */
+	@Test
+	public void midletLifecycle() throws Exception {
+		javax.microedition.midlet.MIDlet.events.clear();
+		Vm vm = vm(compile(
+				"public class GameMidlet extends javax.microedition.midlet.MIDlet"
+						+ " implements javax.microedition.lcdui.CommandListener {"
+						+ " public static int flag;"
+						+ " public GameMidlet() { flag |= 16; }"
+						+ " protected void startApp() {"
+						+ "  javax.microedition.lcdui.Display d = javax.microedition.lcdui.Display.getDisplay(this);"
+						+ "  javax.microedition.lcdui.Form f = new javax.microedition.lcdui.Form(\"hi\");"
+						+ "  f.addCommand(new javax.microedition.lcdui.Command(\"exit\", 7, 0));"
+						+ "  f.setCommandListener(this);"
+						+ "  d.setCurrent(f);"
+						+ "  flag |= 1; }"
+						+ " protected void pauseApp() { flag |= 2; }"
+						+ " protected void destroyApp(boolean u) { flag |= 4; }"
+						+ " public void commandAction(javax.microedition.lcdui.Command c,"
+						+ "    javax.microedition.lcdui.Displayable d) {"
+						+ "  if (c.getLabel().equals(\"exit\")) { flag |= 8; notifyDestroyed(); } }"
+						+ " public static int probe() { return flag; } }"));
+		vm.registerShadow(javax.microedition.midlet.MIDlet.class,
+				new Vm.ShadowFactory() {
+					public Object create(Vm vm, VmObject guest) {
+						return new MidletShadow(vm, guest);
+					}
+				});
+		VmObject guest = vm.newGuestObject("GameMidlet");
+		// the host-super <init> manifested the shadow midlet
+		assertTrue(guest.hostShadow instanceof javax.microedition.midlet.MIDlet);
+		MidletShadow midlet = (MidletShadow) guest.hostShadow;
+		assertEquals(16, vm.invokeStatic("GameMidlet", "probe", "()I"));
+
+		midlet.launch(); // AMS-style: host calls into guest code
+		assertEquals(16 | 1, vm.invokeStatic("GameMidlet", "probe", "()I"));
+		// guest passed `this` to Display.getDisplay -> host saw the same shadow
+		javax.microedition.lcdui.Display d =
+				javax.microedition.lcdui.Display.getDisplay(midlet);
+		assertSame(midlet, d.owner);
+		javax.microedition.lcdui.Form f =
+				(javax.microedition.lcdui.Form) d.getCurrent();
+		assertEquals("hi", f.getTitle());
+		// host fires the command -> CommandListener proxy -> guest commandAction
+		f.fire(f.commands.get(0));
+		assertEquals(16 | 1 | 8, vm.invokeStatic("GameMidlet", "probe", "()I"));
+		// guest notifyDestroyed() reached the host through the shadow
+		assertEquals(java.util.Arrays.asList("destroyed"),
+				javax.microedition.midlet.MIDlet.events);
+
+		midlet.pause();
+		midlet.destroy(true);
+		assertEquals(16 | 1 | 8 | 2 | 4, vm.invokeStatic("GameMidlet", "probe", "()I"));
+	}
+
 	@Test
 	public void stringIdentity() throws Exception {
 		Vm vm = vm(compile(
