@@ -203,6 +203,34 @@ public class InterpreterTest {
 		assertEquals(7, run(vm, "PW", "go"));
 	}
 
+	/**
+	 * A host->guest callback arriving while executorThread still names this
+	 * host thread but executor is null must NOT NPE on cur.frames. On device,
+	 * a VmError escaping pump() left exactly that poisoned pair behind; every
+	 * later keyPressed/keyReleased/paint callback then NPE'd inside
+	 * callFromHost and was swallowed by the caller — which played on hardware
+	 * as stuck keys, latched movement and huge input latency.
+	 */
+	@Test
+	public void callFromHostWithStaleExecutorThread() throws Exception {
+		Vm vm = vm(compile(
+				"public class Cb { int last; public void key(int k) { last = k; }"
+						+ " public int get() { return last; } }"));
+		VmObject recv = vm.newGuestObject("Cb");
+		java.lang.reflect.Field ft = Vm.class.getDeclaredField("executorThread");
+		java.lang.reflect.Field fe = Vm.class.getDeclaredField("executor");
+		ft.setAccessible(true);
+		fe.setAccessible(true);
+		ft.set(vm, Thread.currentThread());
+		fe.set(vm, null);
+		try {
+			vm.callFromHost(recv, "key", "(I)V", 7);
+		} finally {
+			ft.set(vm, null);
+		}
+		assertEquals(7, vm.callFromHost(recv, "get", "()I"));
+	}
+
 	@Test
 	public void greenThreads() throws Exception {
 		Vm vm = vm(compile(

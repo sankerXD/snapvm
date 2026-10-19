@@ -237,21 +237,15 @@ public final class Vm {
 	/** run the scheduler until idle or budget (total instructions) exhausted. */
 	public void pump(long budget) {
 		synchronized (execLock) {
-			Thread prev = executorThread;
-			executorThread = Thread.currentThread();
 			long used = 0;
 			for (;;) {
 				VmThread t = nextRunnable();
 				if (t == null)
 					break;
-				executor = t;
-				long q = budget > 0 ? Math.max(1, budget - used) : Long.MAX_VALUE;
-				used += Interpreter.execute(this, t, q);
-				executor = null;
+				used += runSlice(t, budget > 0 ? Math.max(1, budget - used) : Long.MAX_VALUE);
 				if (budget > 0 && used >= budget)
 					break;
 			}
-			executorThread = prev;
 		}
 	}
 
@@ -417,36 +411,46 @@ public final class Vm {
 	 * that needs the lock to produce the wakeup.
 	 */
 	private void runUntilDone(VmThread t) {
-		Thread prev = executorThread;
 		for (;;) {
 			synchronized (execLock) {
-				executorThread = Thread.currentThread();
-				try {
-					if (canRun(t)) {
-						executor = t;
-						Interpreter.execute(this, t, Long.MAX_VALUE);
-						executor = null;
-					}
-					if (!t.isAlive())
-						return;
-					if (canRun(t))
-						continue;
-					// t parked: let other green threads try to unblock it
-					pump();
-					if (!t.isAlive() || canRun(t))
-						continue;
-					if (pendingWork() < 0)
-						return;
-				} finally {
-					executor = null;
-					executorThread = prev;
-				}
+				if (canRun(t))
+					runSlice(t, Long.MAX_VALUE);
+				if (!t.isAlive())
+					return;
+				if (canRun(t))
+					continue;
+				// t parked: let other green threads try to unblock it
+				pump();
+				if (!t.isAlive() || canRun(t))
+					continue;
+				if (pendingWork() < 0)
+					return;
 			}
 			// parked with work pending elsewhere — release the lock and yield
 			try {
 				Thread.sleep(1);
 			} catch (InterruptedException ignored) {
 			}
+		}
+	}
+
+	/**
+	 * One execute() slice on the current host thread. executor/executorThread
+	 * are only set for the duration of Interpreter.execute: callFromHost treats
+	 * executorThread==currentThread as permission to nest on executor, so both
+	 * must be null between slices and restored even when a VmError escapes —
+	 * a stale executorThread makes every later host callback on this thread
+	 * NPE on a null executor and get silently dropped by the caller.
+	 */
+	private long runSlice(VmThread t, long quota) {
+		executor = t;
+		Thread prev = executorThread;
+		executorThread = Thread.currentThread();
+		try {
+			return Interpreter.execute(this, t, quota);
+		} finally {
+			executor = null;
+			executorThread = prev;
 		}
 	}
 
@@ -565,12 +569,12 @@ public final class Vm {
 	 */
 	public Object callFromHost(final Object recv, final String name, final String desc,
 			final Object... args) {
-		if (Thread.currentThread() == executorThread) {
+		VmThread cur;
+		if (Thread.currentThread() == executorThread && (cur = executor) != null) {
 			if (!(recv instanceof VmObject)) {
 				VmClass hc = resolveClass(recv.getClass().getName());
-				return bridge.call(executor, hc.name, name, desc, joinArgs(recv, args), 0);
+				return bridge.call(cur, hc.name, name, desc, joinArgs(recv, args), 0);
 			}
-			VmThread cur = executor;
 			int depth = cur.frames.size();
 			pushInvoke(cur, recv, name, desc, joinArgs(recv, args));
 			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
