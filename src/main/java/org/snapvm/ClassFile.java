@@ -47,6 +47,43 @@ final class ClassFile {
 	static final class Ref {
 		int tag; // 9 field, 10 method, 11 iface method
 		String owner, name, desc;
+		private int argSlots = -1, argCount = -1, retKind = -1;
+		String key;          // name|desc — methodMap/declaredMethods lookup key
+		// resolved caches — classes never unload, so bindings stay valid
+		VmClass ownerClass;
+		int fieldSlot = -1;              // guest-field flattened slot
+		VmClass staticOwner;             // guest static field owner
+		int staticSlot = -1;
+		VmClass cacheRecv;               // monomorphic inline cache for virtuals
+		ClassFile.Method cacheMethod;
+		VmClass cacheDecl;
+
+		int argSlots() {
+			if (argSlots < 0)
+				argSlots = VmClass.argSlots(desc);
+			return argSlots;
+		}
+
+		int argCount() {
+			if (argCount < 0)
+				argCount = VmClass.countArgs(desc);
+			return argCount;
+		}
+
+		/** 0 = void, 1 = single-slot, 2 = wide return. */
+		int retKind() {
+			if (retKind < 0) {
+				String rt = VmClass.returnType(desc);
+				retKind = rt.equals("V") ? 0 : VmClass.isWide(rt) ? 2 : 1;
+			}
+			return retKind;
+		}
+
+		String key() {
+			if (key == null)
+				key = name + "|" + desc;
+			return key;
+		}
 	}
 
 	static final class NameAndType {

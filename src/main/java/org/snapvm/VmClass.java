@@ -281,15 +281,20 @@ public final class VmClass {
 
 	/** static/special resolution: find method in this class or guest supers. */
 	ClassFile.Method findDeclared(String name, String desc) {
+		return findDeclared(name + "|" + desc);
+	}
+
+	/** key = name|desc, precomputed on the Ref — no per-call concat. */
+	ClassFile.Method findDeclared(String key) {
 		for (VmClass c = this; c != null && !c.host; c = c.superClass) {
-			ClassFile.Method m = c.declaredMethods.get(name + "|" + desc);
+			ClassFile.Method m = c.declaredMethods.get(key);
 			if (m != null)
 				return m;
 		}
 		// interface superinterfaces for invokeinterface
 		if (interfaces != null)
 			for (VmClass i : interfaces) {
-				ClassFile.Method m = i.findDeclared(name, desc);
+				ClassFile.Method m = i.findDeclared(key);
 				if (m != null)
 					return m;
 			}
@@ -299,6 +304,10 @@ public final class VmClass {
 	/** resolve instance/virtual method: search this class's merged table (covers overrides). */
 	ClassFile.Method findMethod(String name, String desc) {
 		return methodMap.get(name + "|" + desc);
+	}
+
+	ClassFile.Method findMethod(String key) {
+		return methodMap.get(key);
 	}
 
 	/** instance field slot index (global, flattened over supers); null if absent. */

@@ -26,6 +26,8 @@ public final class Vm {
 	}
 
 	final Map<String, VmClass> classes = new HashMap<>();
+	/** Dead frames available for reuse — avoids locals/stack array churn per call. */
+	final java.util.ArrayDeque<Frame> framePool = new java.util.ArrayDeque<>();
 	final Map<String, String> interned = new HashMap<>();
 	final IdentityHashMap<Object, Monitor> monitors = new IdentityHashMap<>();
 	final IdentityHashMap<Object, Object> proxies = new IdentityHashMap<>();   // proxy -> guest obj
@@ -54,6 +56,24 @@ public final class Vm {
 	public Vm() {
 		j2meProps.setProperty("microedition.platform", "JL-Modern");
 		j2meProps.setProperty("microedition.encoding", "UTF-8");
+		// bundled guest-side CLDC classes — container/StringBuffer calls become
+		// plain guest bytecode (fast, and snapshot-serializable for free)
+		addClassSource(new ClassSource() {
+			public byte[] findClass(String name) {
+				InputStream in = Vm.class.getResourceAsStream("/cldc/" + name + ".classdata");
+				if (in == null)
+					return null;
+				try {
+					return readAll(in);
+				} catch (IOException e) {
+					return null;
+				}
+			}
+
+			public InputStream findResource(String path) {
+				return null;
+			}
+		});
 	}
 
 	/** register a classpath. dirMode: findClass gets "com/foo/Bar" -> bytes. */
@@ -234,6 +254,26 @@ public final class Vm {
 		pump(0);
 	}
 
+	/** cumulative guest instructions executed; wraps naturally. */
+	public volatile long totalOps;
+
+	/** diagnostics: runUntilDone exits where the entry thread was still parked. */
+	public volatile int abandonedRuns;
+
+	/** diagnostics: guest sleep() calls and requested ms. */
+	public volatile int sleepCalls;
+	public volatile long sleepMsTotal;
+
+	/** diagnostics: per-callsite host-call counts (shared live map). */
+	public java.util.Map<String, java.util.concurrent.atomic.AtomicLong> callStats() {
+		return bridge.callStats;
+	}
+
+	/** Per-call stat counting costs a concat + map ops — off unless diagnostics needed. */
+	public void setCallStatsEnabled(boolean on) {
+		bridge.statsOn = on;
+	}
+
 	/** run the scheduler until idle or budget (total instructions) exhausted. */
 	public void pump(long budget) {
 		synchronized (execLock) {
@@ -246,6 +286,7 @@ public final class Vm {
 				if (budget > 0 && used >= budget)
 					break;
 			}
+			totalOps += used;
 		}
 	}
 
@@ -414,7 +455,7 @@ public final class Vm {
 		for (;;) {
 			synchronized (execLock) {
 				if (canRun(t))
-					runSlice(t, Long.MAX_VALUE);
+					totalOps += runSlice(t, Long.MAX_VALUE);
 				if (!t.isAlive())
 					return;
 				if (canRun(t))
@@ -423,8 +464,10 @@ public final class Vm {
 				pump();
 				if (!t.isAlive() || canRun(t))
 					continue;
-				if (pendingWork() < 0)
+				if (pendingWork() < 0) {
+					abandonedRuns++; // diagnostics: host callback returned with guest frames still parked
 					return;
+				}
 			}
 			// parked with work pending elsewhere — release the lock and yield
 			try {
@@ -485,7 +528,8 @@ public final class Vm {
 		ClassFile.Method m = c.findDeclared(name, desc);
 		if (m == null || (m.access & 0x0008) == 0)
 			throw new VmError("no static " + c.name + "." + name + desc);
-		Frame f = new Frame(c, m);
+		Frame f = allocFrame(c, m);
+		f.external = true;
 		fillArgs(f, desc, args, false);
 		pushFrame(t, f);
 	}
@@ -495,6 +539,24 @@ public final class Vm {
 	 * TERMINATED by a nested run (e.g. a blocking clinit); revive it so the
 	 * scheduler picks it up again.
 	 */
+	/** Take a pooled frame whose arrays fit, or allocate. Caller sets flags. */
+	Frame allocFrame(VmClass owner, ClassFile.Method m) {
+		int needL = m.code.maxLocals, needS = m.code.maxStack + 1;
+		for (Frame f : framePool)
+			if (f.locals.length >= needL && f.stack.length >= needS) {
+				framePool.remove(f);
+				f.reset(owner, m);
+				return f;
+			}
+		return new Frame(owner, m);
+	}
+
+	/** Return a dead frame to the pool (small bound — pools only need hot sizes). */
+	void freeFrame(Frame f) {
+		if (framePool.size() < 128)
+			framePool.add(f);
+	}
+
 	private static void pushFrame(VmThread t, Frame f) {
 		t.frames.add(f);
 		if (t.state == VmThread.TERMINATED)
@@ -521,7 +583,8 @@ public final class Vm {
 				return;
 			}
 			ensureInitBlocking(owner, t);
-			Frame f = new Frame(ownerOf(owner, m), m);
+			Frame f = allocFrame(ownerOf(owner, m), m);
+			f.external = true;
 			fillArgs(f, desc, args, true);
 			pushFrame(t, f);
 			return;
@@ -634,7 +697,7 @@ public final class Vm {
 				if (s != null)
 					x.statics[s] = e.getValue();
 			}
-			Frame f = new Frame(x, clinit);
+			Frame f = allocFrame(x, clinit);
 			t.frames.add(f);
 			return false;
 		}
@@ -682,6 +745,8 @@ public final class Vm {
 	}
 
 	void greenSleep(VmThread t, long ms) {
+		sleepCalls++;
+		sleepMsTotal += ms;
 		t.state = VmThread.TIMED_WAITING;
 		t.wakeTime = System.currentTimeMillis() + ms;
 	}
@@ -789,7 +854,29 @@ public final class Vm {
 	}
 
 	private final Map<String, ParkedCall> parkedCalls = new HashMap<>();
+	private final Map<String, ParkedCall> parkedCache = new HashMap<>();
+	private static final ParkedCall NONE = (v, t, a, d) -> { };
 	private static final Object PARKED = new Object();
+
+	/**
+	 * A host-call fast path: invokes directly without reflection/marshal.
+	 * args[0] is the receiver for instance methods; values arrive in guest
+	 * representation (int-family as Integer, long as Long, refs raw).
+	 */
+	public interface FastCall {
+		Object invoke(Object[] args) throws Exception;
+	}
+
+	private final Map<String, FastCall> fastCalls = new HashMap<>();
+
+	/** key format: "javax/microedition/lcdui/Graphics.drawImage(Ljavax/microedition/lcdui/Image;III)V" */
+	public void registerFastCall(String methodKey, FastCall call) {
+		fastCalls.put(methodKey, call);
+	}
+
+	FastCall fastCall(String ownerName, String name, String desc) {
+		return fastCalls.get(ownerName + "." + name + desc);
+	}
 
 	/** key format: "javax/microedition/lcdui/Canvas.serviceRepaints()V" */
 	public void registerParkedCall(String methodKey, ParkedCall call) {
@@ -797,27 +884,32 @@ public final class Vm {
 	}
 
 	ParkedCall parkedCall(String ownerName, String name, String desc) {
-		String suffix = "." + name + desc;
-		ParkedCall pc = parkedCalls.get(ownerName + suffix);
+		String key = ownerName + "." + name + desc;
+		ParkedCall pc = parkedCache.get(key);
 		if (pc != null)
-			return pc;
-		// the call site names a guest class's host boundary (e.g. FullCanvas),
-		// not the registering class — walk the host hierarchy
-		try {
-			for (Class<?> h = Class.forName(ownerName.replace('/', '.'));
-					h != null; h = h.getSuperclass()) {
-				pc = parkedCalls.get(h.getName().replace('.', '/') + suffix);
-				if (pc != null)
-					return pc;
-				for (Class<?> i : h.getInterfaces()) {
-					pc = parkedCalls.get(i.getName().replace('.', '/') + suffix);
-					if (pc != null)
-						return pc;
+			return pc == NONE ? null : pc;
+		String suffix = "." + name + desc;
+		pc = parkedCalls.get(ownerName + suffix);
+		if (pc == null) {
+			// the call site names a guest class's host boundary (e.g. FullCanvas),
+			// not the registering class — walk the host hierarchy
+			try {
+				for (Class<?> h = Class.forName(ownerName.replace('/', '.'));
+						h != null && pc == null; h = h.getSuperclass()) {
+					pc = parkedCalls.get(h.getName().replace('.', '/') + suffix);
+					if (pc == null) {
+						for (Class<?> i : h.getInterfaces()) {
+							pc = parkedCalls.get(i.getName().replace('.', '/') + suffix);
+							if (pc != null)
+								break;
+						}
+					}
 				}
+			} catch (ClassNotFoundException ignored) {
 			}
-		} catch (ClassNotFoundException ignored) {
 		}
-		return null;
+		parkedCache.put(key, pc == null ? NONE : pc);
+		return pc;
 	}
 
 	/** Run a parked call: the green thread sleeps until the handler's done. */

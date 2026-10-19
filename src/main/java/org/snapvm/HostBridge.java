@@ -21,6 +21,12 @@ final class HostBridge {
 	private final Map<String, Field> fieldCache = new HashMap<>();
 	private final Map<String, Constructor<?>> ctorCache = new HashMap<>();
 
+	/** diagnostics: per-callsite host-call counts (owner.name). */
+	public final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> callStats =
+			new java.util.concurrent.ConcurrentHashMap<>();
+	/** Per-call stat counting costs a concat + map ops — diagnostics only. */
+	public volatile boolean statsOn = false;
+
 	HostBridge(Vm vm) {
 		this.vm = vm;
 	}
@@ -198,6 +204,15 @@ final class HostBridge {
 	 * 3 constructor (returns new object, args exclude marker).
 	 */
 	Object call(VmThread t, String ownerName, String name, String desc, Object[] args, int kind) {
+		if (statsOn) {
+			java.util.concurrent.atomic.AtomicLong ctr = callStats.get(ownerName + "." + name);
+			if (ctr == null) {
+				callStats.putIfAbsent(ownerName + "." + name,
+						new java.util.concurrent.atomic.AtomicLong());
+				ctr = callStats.get(ownerName + "." + name);
+			}
+			ctr.incrementAndGet();
+		}
 		// VM-provided semantics first
 		Object r = builtin(t, ownerName, name, desc, args, kind);
 		if (r != BuiltinMarker.NOT_HANDLED)
@@ -206,6 +221,20 @@ final class HostBridge {
 		Vm.ParkedCall pc = vm.parkedCall(ownerName, name, desc);
 		if (pc != null)
 			return vm.callParked(t, pc, args);
+
+		// adapter-registered direct calls — guest receivers must marshal first
+		if (!(kind == 0 && args.length > 0 && args[0] instanceof VmObject)) {
+			Vm.FastCall fc = vm.fastCall(ownerName, name, desc);
+			if (fc != null) {
+				try {
+					return Vm.fromHost(fc.invoke(args));
+				} catch (VmError | VmException e) {
+					throw e;
+				} catch (Exception e) {
+					throw new VmException(e);
+				}
+			}
+		}
 
 		Class<?> hc;
 		try {
@@ -225,8 +254,13 @@ final class HostBridge {
 			if (or != BuiltinMarker.NOT_HANDLED)
 				return Vm.fromHost(or);
 		}
+		Object fr = fastBuiltin(t, ownerName, name, desc, args, kind);
+		if (fr != BuiltinMarker.NOT_HANDLED)
+			return Vm.fromHost(fr);
 		try {
 			if (kind == 3) {
+				if (hc == String.class && args.length == 1 && args[0] instanceof VmObject)
+					return new String(guestToString(t, (VmObject) args[0]));
 				Constructor<?> c = findCtor(hc, desc);
 				Class<?>[] pts = c.getParameterTypes();
 				Object[] margs = new Object[pts.length];
@@ -541,6 +575,658 @@ final class HostBridge {
 			case "lineSeparator": return "\n";
 		}
 		return BuiltinMarker.NOT_HANDLED;
+	}
+
+	// ---------- hot-path builtins (direct calls, no reflection) ----------
+	// J2ME engines iterate Vector/Hashtable and pound Graphics/Image/Font every
+	// frame; reflective dispatch costs ~5-10us per call on-device, which turns
+	// into ~30ms/frame on list-heavy games. These direct casts bypass it.
+	// Every method returns NOT_HANDLED for signatures it doesn't cover so the
+	// reflective path stays the fallback.
+
+	private static Object NOT() {
+		return BuiltinMarker.NOT_HANDLED;
+	}
+
+	/** Run the guest's own toString() on a VmObject (needed when host APIs like
+	 *  String.valueOf / String(CharSequence) receive guest objects). */
+	private String guestToString(VmThread t, VmObject o) {
+		int depth = t.frames.size();
+		vm.pushInvoke(t, o, "toString", "()Ljava/lang/String;", new Object[]{o});
+		Interpreter.execute(vm, t, Long.MAX_VALUE, depth);
+		Object r = t.nestedResult;
+		return r == null ? null : (String) r;
+	}
+
+	private static boolean anyGuest(Object[] a) {
+		for (Object o : a)
+			if (o instanceof VmObject)
+				return true;
+		return false;
+	}
+
+	private Object fastBuiltin(VmThread t, String owner, String name, String desc, Object[] args, int kind) {
+		// ctors carry no receiver — args[] may be empty
+		if (kind == 3)
+			return NOT();
+		// instance methods with a guest receiver must marshal (shadow/error)
+		if (kind != 1 && args.length > 0 && args[0] instanceof VmObject)
+			return NOT();
+		try {
+			switch (owner) {
+				case "java/util/Vector": return vectorBuiltin(name, desc, args, kind);
+				case "java/util/Stack": return stackBuiltin(name, desc, args, kind);
+				case "java/util/Hashtable": return tableBuiltin(name, desc, args, kind);
+				case "java/util/Enumeration": return enumBuiltin(name, args);
+				case "java/util/Random": return randomBuiltin(name, desc, args, kind);
+				case "java/lang/String": return stringBuiltin(t, name, desc, args, kind);
+				case "java/lang/StringBuffer": return sbBuiltin(name, desc, args);
+				case "java/lang/StringBuilder": return sbBuiltin(name, desc, args);
+				case "java/lang/Math": return mathBuiltin(name, desc, args);
+				case "java/lang/Integer": return intBuiltin(name, desc, args, kind);
+				case "java/lang/Long": return longBuiltin(name, desc, args, kind);
+				case "java/lang/Float": return floatBuiltin(name, desc, args, kind);
+				case "java/lang/Double": return doubleBuiltin(name, desc, args, kind);
+				case "java/io/InputStream":
+				case "java/io/ByteArrayInputStream":
+				case "java/io/FilterInputStream":
+				case "java/io/BufferedInputStream":
+					return isBuiltin(name, desc, args);
+				case "java/io/DataInputStream": return disBuiltin(name, desc, args);
+				default: return NOT();
+			}
+		} catch (VmError | VmException e) {
+			throw e;
+		} catch (Exception | LinkageError | AssertionError e) {
+			throw new VmException(e);
+		}
+	}
+
+	private static Object vectorBuiltin(String name, String desc, Object[] args, int kind) {
+		java.util.Vector<Object> v = (java.util.Vector<Object>) args[0];
+		switch (name) {
+			case "size": return v.size();
+			case "isEmpty": return v.isEmpty() ? 1 : 0;
+			case "capacity": return v.capacity();
+			case "elementAt": return v.elementAt((Integer) args[1]);
+			case "firstElement": return v.firstElement();
+			case "lastElement": return v.lastElement();
+			case "get": return v.get((Integer) args[1]);
+			case "set": return v.set((Integer) args[1], args[2]);
+			case "elements": return v.elements();
+			case "indexOf":
+				return desc.equals("(Ljava/lang/Object;I)I")
+						? v.indexOf(args[1], (Integer) args[2])
+						: v.indexOf(args[1]);
+			case "lastIndexOf":
+				return desc.equals("(Ljava/lang/Object;I)I")
+						? v.lastIndexOf(args[1], (Integer) args[2])
+						: v.lastIndexOf(args[1]);
+			case "contains": return v.contains(args[1]) ? 1 : 0;
+			case "containsAll": return v.containsAll((java.util.Collection<?>) args[1]) ? 1 : 0;
+			case "addElement": v.addElement(args[1]); return null;
+			case "add":
+				if (desc.equals("(ILjava/lang/Object;)V")) {
+					v.add((Integer) args[1], args[2]);
+					return null;
+				}
+				return v.add(args[1]) ? 1 : 0;
+			case "addAll": return v.addAll((java.util.Collection<?>) args[1]) ? 1 : 0;
+			case "insertElementAt": v.insertElementAt(args[1], (Integer) args[2]); return null;
+			case "setElementAt": v.setElementAt(args[1], (Integer) args[2]); return null;
+			case "removeElement": return v.removeElement(args[1]) ? 1 : 0;
+			case "removeElementAt": v.removeElementAt((Integer) args[1]); return null;
+			case "removeAllElements": v.removeAllElements(); return null;
+			case "remove":
+				if (desc.equals("(I)Ljava/lang/Object;"))
+					return v.remove((int) (Integer) args[1]);
+				return v.remove(args[1]) ? 1 : 0;
+			case "clear": v.clear(); return null;
+			case "setSize": v.setSize((Integer) args[1]); return null;
+			case "ensureCapacity": v.ensureCapacity((Integer) args[1]); return null;
+			case "trimToSize": v.trimToSize(); return null;
+			case "copyInto": v.copyInto((Object[]) args[1]); return null;
+			case "toArray": return v.toArray();
+			case "iterator": return v.iterator();
+			case "toString": return v.toString();
+			case "hashCode": return v.hashCode();
+			case "equals": return v.equals(args[1]) ? 1 : 0;
+			case "clone": return v.clone();
+			default: return NOT();
+		}
+	}
+
+	private static Object stackBuiltin(String name, String desc, Object[] args, int kind) {
+		java.util.Stack<Object> s = (java.util.Stack<Object>) args[0];
+		switch (name) {
+			case "push": return s.push(args[1]);
+			case "pop": return s.pop();
+			case "peek": return s.peek();
+			case "empty": return s.empty() ? 1 : 0;
+			case "search": return s.search(args[1]);
+			default:
+				// inherited Vector members called with owner=Stack
+				return vectorBuiltin(name, desc, args, kind);
+		}
+	}
+
+	private static Object tableBuiltin(String name, String desc, Object[] args, int kind) {
+		java.util.Hashtable<Object, Object> t = (java.util.Hashtable<Object, Object>) args[0];
+		switch (name) {
+			case "size": return t.size();
+			case "isEmpty": return t.isEmpty() ? 1 : 0;
+			case "get": return t.get(args[1]);
+			case "getOrDefault": return t.getOrDefault(args[1], args[2]);
+			case "put": return t.put(args[1], args[2]);
+			case "remove": return t.remove(args[1]);
+			case "containsKey": return t.containsKey(args[1]) ? 1 : 0;
+			case "contains":
+			case "containsValue": return t.contains(args[1]) ? 1 : 0;
+			case "keys": return t.keys();
+			case "elements": return t.elements();
+			case "keySet": return t.keySet();
+			case "clear": t.clear(); return null;
+			case "toString": return t.toString();
+			default: return NOT();
+		}
+	}
+
+	private static Object enumBuiltin(String name, Object[] args) {
+		java.util.Enumeration<?> e = (java.util.Enumeration<?>) args[0];
+		switch (name) {
+			case "hasMoreElements": return e.hasMoreElements() ? 1 : 0;
+			case "nextElement": return e.nextElement();
+			default: return NOT();
+		}
+	}
+
+	private static Object randomBuiltin(String name, String desc, Object[] args, int kind) {
+		java.util.Random r = (java.util.Random) args[0];
+		switch (name) {
+			case "nextInt":
+				return desc.equals("(I)I") ? r.nextInt((Integer) args[1]) : r.nextInt();
+			case "nextLong": return r.nextLong();
+			case "nextBoolean": return r.nextBoolean() ? 1 : 0;
+			case "nextFloat": return r.nextFloat();
+			case "nextDouble": return r.nextDouble();
+			case "nextGaussian": return r.nextGaussian();
+			case "nextBytes": r.nextBytes((byte[]) args[1]); return null;
+			case "setSeed": r.setSeed((Long) args[1]); return null;
+			default: return NOT();
+		}
+	}
+
+	private Object stringBuiltin(VmThread t, String name, String desc, Object[] args, int kind) {
+		if (kind == 1) { // statics
+			if (!name.equals("valueOf"))
+				return NOT();
+			switch (desc) {
+				case "(I)Ljava/lang/String;": return String.valueOf((Integer) args[0]);
+				case "(J)Ljava/lang/String;": return String.valueOf((Long) args[0]);
+				case "(Z)Ljava/lang/String;": return String.valueOf(((Integer) args[0]) != 0);
+				case "(C)Ljava/lang/String;": return String.valueOf((char) (int) (Integer) args[0]);
+				case "(F)Ljava/lang/String;": return String.valueOf((Float) args[0]);
+				case "(D)Ljava/lang/String;": return String.valueOf((Double) args[0]);
+				case "([C)Ljava/lang/String;": return String.valueOf((char[]) args[0]);
+				case "([CII)Ljava/lang/String;":
+					return String.valueOf((char[]) args[0], (Integer) args[1], (Integer) args[2]);
+				case "(Ljava/lang/Object;)Ljava/lang/String;":
+					return args[0] instanceof VmObject
+							? guestToString(t, (VmObject) args[0])
+							: String.valueOf(args[0]);
+				default: return NOT();
+			}
+		}
+		String s = (String) args[0];
+		switch (name) {
+			case "length": return s.length();
+			case "isEmpty": return s.isEmpty() ? 1 : 0;
+			case "charAt": return (int) s.charAt((Integer) args[1]);
+			case "codePointAt": return s.codePointAt((Integer) args[1]);
+			case "substring":
+				return desc.equals("(I)Ljava/lang/String;")
+						? s.substring((Integer) args[1])
+						: s.substring((Integer) args[1], (Integer) args[2]);
+			case "indexOf":
+				switch (desc) {
+					case "(I)I": return s.indexOf((Integer) args[1]);
+					case "(II)I": return s.indexOf((Integer) args[1], (Integer) args[2]);
+					case "(Ljava/lang/String;)I": return s.indexOf((String) args[1]);
+					case "(Ljava/lang/String;I)I":
+						return s.indexOf((String) args[1], (Integer) args[2]);
+					default: return NOT();
+				}
+			case "lastIndexOf":
+				switch (desc) {
+					case "(I)I": return s.lastIndexOf((Integer) args[1]);
+					case "(II)I": return s.lastIndexOf((Integer) args[1], (Integer) args[2]);
+					case "(Ljava/lang/String;)I": return s.lastIndexOf((String) args[1]);
+					case "(Ljava/lang/String;I)I":
+						return s.lastIndexOf((String) args[1], (Integer) args[2]);
+					default: return NOT();
+				}
+			case "startsWith":
+				return desc.equals("(Ljava/lang/String;)Z")
+						? (s.startsWith((String) args[1]) ? 1 : 0)
+						: (s.startsWith((String) args[1], (Integer) args[2]) ? 1 : 0);
+			case "endsWith": return s.endsWith((String) args[1]) ? 1 : 0;
+			case "contains": return s.contains((CharSequence) args[1]) ? 1 : 0;
+			case "equals": return s.equals(args[1]) ? 1 : 0;
+			case "equalsIgnoreCase": return s.equalsIgnoreCase((String) args[1]) ? 1 : 0;
+			case "compareTo": return s.compareTo((String) args[1]);
+			case "compareToIgnoreCase": return s.compareToIgnoreCase((String) args[1]);
+			case "contentEquals": return s.contentEquals((CharSequence) args[1]) ? 1 : 0;
+			case "concat": return s.concat((String) args[1]);
+			case "toUpperCase":
+				return desc.equals("()Ljava/lang/String;") ? s.toUpperCase() : NOT();
+			case "toLowerCase":
+				return desc.equals("()Ljava/lang/String;") ? s.toLowerCase() : NOT();
+			case "trim": return s.trim();
+			case "toCharArray": return s.toCharArray();
+			case "getChars":
+				s.getChars((Integer) args[1], (Integer) args[2], (char[]) args[3],
+						(Integer) args[4]);
+				return null;
+			case "getBytes":
+				return desc.equals("()[B") ? s.getBytes() : NOT();
+			case "replace":
+				switch (desc) {
+					case "(CC)Ljava/lang/String;":
+						return s.replace((char) (int) (Integer) args[1],
+								(char) (int) (Integer) args[2]);
+					case "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;":
+						return s.replace((CharSequence) args[1], (CharSequence) args[2]);
+					default: return NOT();
+				}
+			case "split": return s.split((String) args[1]);
+			case "toString": return s;
+			case "hashCode": return s.hashCode();
+			default: return NOT();
+		}
+	}
+
+	private static Object sbBuiltin(String name, String desc, Object[] args) {
+		Object r = args[0];
+		if (r instanceof StringBuilder)
+			return sbBld((StringBuilder) r, name, desc, args);
+		if (r instanceof StringBuffer)
+			return sbBuf((StringBuffer) r, name, desc, args);
+		return NOT();
+	}
+
+	private static Object sbBld(StringBuilder sb, String name, String desc, Object[] args) {
+		switch (name) {
+			case "append":
+				switch (desc) {
+					case "(Ljava/lang/String;)Ljava/lang/StringBuffer;":
+					case "(Ljava/lang/String;)Ljava/lang/StringBuilder;":
+						return sb.append((String) args[1]);
+					case "(I)Ljava/lang/StringBuffer;":
+					case "(I)Ljava/lang/StringBuilder;":
+						return sb.append((int) (Integer) args[1]);
+					case "(J)Ljava/lang/StringBuffer;":
+					case "(J)Ljava/lang/StringBuilder;":
+						return sb.append((long) (Long) args[1]);
+					case "(Z)Ljava/lang/StringBuffer;":
+					case "(Z)Ljava/lang/StringBuilder;":
+						return sb.append(((Integer) args[1]) != 0);
+					case "(C)Ljava/lang/StringBuffer;":
+					case "(C)Ljava/lang/StringBuilder;":
+						return sb.append((char) (int) (Integer) args[1]);
+					case "(F)Ljava/lang/StringBuffer;":
+					case "(F)Ljava/lang/StringBuilder;":
+						return sb.append((float) (Float) args[1]);
+					case "(D)Ljava/lang/StringBuffer;":
+					case "(D)Ljava/lang/StringBuilder;":
+						return sb.append((double) (Double) args[1]);
+					case "(Ljava/lang/Object;)Ljava/lang/StringBuffer;":
+					case "(Ljava/lang/Object;)Ljava/lang/StringBuilder;":
+						return args[1] instanceof VmObject ? NOT() : sb.append(args[1]);
+					case "([C)Ljava/lang/StringBuffer;":
+					case "([C)Ljava/lang/StringBuilder;":
+						return sb.append((char[]) args[1]);
+					case "([CII)Ljava/lang/StringBuffer;":
+					case "([CII)Ljava/lang/StringBuilder;":
+						return sb.append((char[]) args[1], (Integer) args[2],
+								(Integer) args[3]);
+					default: return NOT();
+				}
+			case "insert":
+				switch (desc) {
+					case "(ILjava/lang/String;)Ljava/lang/StringBuffer;":
+					case "(ILjava/lang/String;)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (String) args[2]);
+					case "(II)Ljava/lang/StringBuffer;":
+					case "(II)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (int) (Integer) args[2]);
+					case "(IJ)Ljava/lang/StringBuffer;":
+					case "(IJ)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (long) (Long) args[2]);
+					case "(IC)Ljava/lang/StringBuffer;":
+					case "(IC)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (char) (int) (Integer) args[2]);
+					case "(ILjava/lang/Object;)Ljava/lang/StringBuffer;":
+					case "(ILjava/lang/Object;)Ljava/lang/StringBuilder;":
+						return args[2] instanceof VmObject ? NOT()
+								: sb.insert((int) (Integer) args[1], args[2]);
+					default: return NOT();
+				}
+			case "toString": return sb.toString();
+			case "length": return sb.length();
+			case "capacity": return sb.capacity();
+			case "charAt": return (int) sb.charAt((Integer) args[1]);
+			case "setCharAt": sb.setCharAt((Integer) args[1], (char) (int) (Integer) args[2]); return null;
+			case "delete": return sb.delete((Integer) args[1], (Integer) args[2]);
+			case "deleteCharAt": return sb.deleteCharAt((Integer) args[1]);
+			case "reverse": return sb.reverse();
+			case "setLength": sb.setLength((Integer) args[1]); return null;
+			case "ensureCapacity": sb.ensureCapacity((Integer) args[1]); return null;
+			case "substring": return sb.substring((Integer) args[1]);
+			case "getChars":
+				sb.getChars((Integer) args[1], (Integer) args[2], (char[]) args[3],
+						(Integer) args[4]);
+				return null;
+			default: return NOT();
+		}
+	}
+
+	private static Object sbBuf(StringBuffer sb, String name, String desc, Object[] args) {
+		switch (name) {
+			case "append":
+				switch (desc) {
+					case "(Ljava/lang/String;)Ljava/lang/StringBuffer;":
+					case "(Ljava/lang/String;)Ljava/lang/StringBuilder;":
+						return sb.append((String) args[1]);
+					case "(I)Ljava/lang/StringBuffer;":
+					case "(I)Ljava/lang/StringBuilder;":
+						return sb.append((int) (Integer) args[1]);
+					case "(J)Ljava/lang/StringBuffer;":
+					case "(J)Ljava/lang/StringBuilder;":
+						return sb.append((long) (Long) args[1]);
+					case "(Z)Ljava/lang/StringBuffer;":
+					case "(Z)Ljava/lang/StringBuilder;":
+						return sb.append(((Integer) args[1]) != 0);
+					case "(C)Ljava/lang/StringBuffer;":
+					case "(C)Ljava/lang/StringBuilder;":
+						return sb.append((char) (int) (Integer) args[1]);
+					case "(F)Ljava/lang/StringBuffer;":
+					case "(F)Ljava/lang/StringBuilder;":
+						return sb.append((float) (Float) args[1]);
+					case "(D)Ljava/lang/StringBuffer;":
+					case "(D)Ljava/lang/StringBuilder;":
+						return sb.append((double) (Double) args[1]);
+					case "(Ljava/lang/Object;)Ljava/lang/StringBuffer;":
+					case "(Ljava/lang/Object;)Ljava/lang/StringBuilder;":
+						return args[1] instanceof VmObject ? NOT() : sb.append(args[1]);
+					case "([C)Ljava/lang/StringBuffer;":
+					case "([C)Ljava/lang/StringBuilder;":
+						return sb.append((char[]) args[1]);
+					case "([CII)Ljava/lang/StringBuffer;":
+					case "([CII)Ljava/lang/StringBuilder;":
+						return sb.append((char[]) args[1], (Integer) args[2],
+								(Integer) args[3]);
+					default: return NOT();
+				}
+			case "insert":
+				switch (desc) {
+					case "(ILjava/lang/String;)Ljava/lang/StringBuffer;":
+					case "(ILjava/lang/String;)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (String) args[2]);
+					case "(II)Ljava/lang/StringBuffer;":
+					case "(II)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (int) (Integer) args[2]);
+					case "(IJ)Ljava/lang/StringBuffer;":
+					case "(IJ)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (long) (Long) args[2]);
+					case "(IC)Ljava/lang/StringBuffer;":
+					case "(IC)Ljava/lang/StringBuilder;":
+						return sb.insert((int) (Integer) args[1], (char) (int) (Integer) args[2]);
+					case "(ILjava/lang/Object;)Ljava/lang/StringBuffer;":
+					case "(ILjava/lang/Object;)Ljava/lang/StringBuilder;":
+						return args[2] instanceof VmObject ? NOT()
+								: sb.insert((int) (Integer) args[1], args[2]);
+					default: return NOT();
+				}
+			case "toString": return sb.toString();
+			case "length": return sb.length();
+			case "capacity": return sb.capacity();
+			case "charAt": return (int) sb.charAt((Integer) args[1]);
+			case "setCharAt": sb.setCharAt((Integer) args[1], (char) (int) (Integer) args[2]); return null;
+			case "delete": return sb.delete((Integer) args[1], (Integer) args[2]);
+			case "deleteCharAt": return sb.deleteCharAt((Integer) args[1]);
+			case "reverse": return sb.reverse();
+			case "setLength": sb.setLength((Integer) args[1]); return null;
+			case "ensureCapacity": sb.ensureCapacity((Integer) args[1]); return null;
+			case "substring": return sb.substring((Integer) args[1]);
+			case "getChars":
+				sb.getChars((Integer) args[1], (Integer) args[2], (char[]) args[3],
+						(Integer) args[4]);
+				return null;
+			default: return NOT();
+		}
+	}
+
+	private static Object mathBuiltin(String name, String desc, Object[] args) {
+		switch (name) {
+			case "abs":
+				switch (desc) {
+					case "(I)I": return Math.abs((Integer) args[0]);
+					case "(J)J": return Math.abs((Long) args[0]);
+					case "(F)F": return Math.abs((Float) args[0]);
+					case "(D)D": return Math.abs((Double) args[0]);
+					default: return NOT();
+				}
+			case "min":
+				switch (desc) {
+					case "(II)I": return Math.min((Integer) args[0], (Integer) args[1]);
+					case "(JJ)J": return Math.min((Long) args[0], (Long) args[1]);
+					case "(FF)F": return Math.min((Float) args[0], (Float) args[1]);
+					case "(DD)D": return Math.min((Double) args[0], (Double) args[1]);
+					default: return NOT();
+				}
+			case "max":
+				switch (desc) {
+					case "(II)I": return Math.max((Integer) args[0], (Integer) args[1]);
+					case "(JJ)J": return Math.max((Long) args[0], (Long) args[1]);
+					case "(FF)F": return Math.max((Float) args[0], (Float) args[1]);
+					case "(DD)D": return Math.max((Double) args[0], (Double) args[1]);
+					default: return NOT();
+				}
+			case "random": return Math.random();
+			case "sqrt": return Math.sqrt((Double) args[0]);
+			case "sin": return Math.sin((Double) args[0]);
+			case "cos": return Math.cos((Double) args[0]);
+			case "tan": return Math.tan((Double) args[0]);
+			case "asin": return Math.asin((Double) args[0]);
+			case "acos": return Math.acos((Double) args[0]);
+			case "atan": return Math.atan((Double) args[0]);
+			case "atan2": return Math.atan2((Double) args[0], (Double) args[1]);
+			case "floor": return Math.floor((Double) args[0]);
+			case "ceil": return Math.ceil((Double) args[0]);
+			case "round":
+				return desc.equals("(F)I") ? Math.round((Float) args[0])
+						: Math.round((Double) args[0]);
+			case "pow": return Math.pow((Double) args[0], (Double) args[1]);
+			case "exp": return Math.exp((Double) args[0]);
+			case "log": return Math.log((Double) args[0]);
+			case "toRadians": return Math.toRadians((Double) args[0]);
+			case "toDegrees": return Math.toDegrees((Double) args[0]);
+			default: return NOT();
+		}
+	}
+
+	private static Object intBuiltin(String name, String desc, Object[] args, int kind) {
+		if (kind == 1) {
+			switch (name) {
+				case "parseInt":
+					return desc.equals("(Ljava/lang/String;)I")
+							? Integer.parseInt((String) args[0])
+							: Integer.parseInt((String) args[0], (Integer) args[1]);
+				case "toString":
+					return desc.equals("(I)Ljava/lang/String;")
+							? Integer.toString((Integer) args[0])
+							: desc.equals("(II)Ljava/lang/String;")
+							? Integer.toString((Integer) args[0], (Integer) args[1])
+							: NOT();
+				case "toHexString": return Integer.toHexString((Integer) args[0]);
+				case "toOctalString": return Integer.toOctalString((Integer) args[0]);
+				case "toBinaryString": return Integer.toBinaryString((Integer) args[0]);
+				case "valueOf":
+					return desc.equals("(I)Ljava/lang/Integer;")
+							? (Integer) args[0] : NOT();
+				default: return NOT();
+			}
+		}
+		Integer i = (Integer) args[0];
+		switch (name) {
+			case "intValue": return i;
+			case "byteValue": return i.byteValue();
+			case "shortValue": return i.shortValue();
+			case "longValue": return i.longValue();
+			case "floatValue": return i.floatValue();
+			case "doubleValue": return i.doubleValue();
+			case "toString": return i.toString();
+			case "hashCode": return i;
+			case "equals": return i.equals(args[1]) ? 1 : 0;
+			case "compareTo": return i.compareTo((Integer) args[1]);
+			default: return NOT();
+		}
+	}
+
+	private static Object longBuiltin(String name, String desc, Object[] args, int kind) {
+		if (kind == 1) {
+			switch (name) {
+				case "parseLong":
+					return desc.equals("(Ljava/lang/String;)J")
+							? Long.parseLong((String) args[0])
+							: Long.parseLong((String) args[0], (Integer) args[1]);
+				case "toString":
+					return desc.equals("(J)Ljava/lang/String;")
+							? Long.toString((Long) args[0])
+							: desc.equals("(JI)Ljava/lang/String;")
+							? Long.toString((Long) args[0], (Integer) args[1])
+							: NOT();
+				case "toHexString": return Long.toHexString((Long) args[0]);
+				case "valueOf":
+					return desc.equals("(J)Ljava/lang/Long;") ? (Long) args[0] : NOT();
+				default: return NOT();
+			}
+		}
+		Long l = (Long) args[0];
+		switch (name) {
+			case "intValue": return l.intValue();
+			case "longValue": return l;
+			case "floatValue": return l.floatValue();
+			case "doubleValue": return l.doubleValue();
+			case "byteValue": return l.byteValue();
+			case "shortValue": return l.shortValue();
+			case "toString": return l.toString();
+			case "hashCode": return l.hashCode();
+			case "equals": return l.equals(args[1]) ? 1 : 0;
+			case "compareTo": return l.compareTo((Long) args[1]);
+			default: return NOT();
+		}
+	}
+
+	private static Object floatBuiltin(String name, String desc, Object[] args, int kind) {
+		if (kind == 1) {
+			switch (name) {
+				case "floatToIntBits": return Float.floatToIntBits((Float) args[0]);
+				case "intBitsToFloat": return Float.intBitsToFloat((Integer) args[0]);
+				case "isNaN": return Float.isNaN((Float) args[0]) ? 1 : 0;
+				case "toString": return Float.toString((Float) args[0]);
+				case "parseFloat": return Float.parseFloat((String) args[0]);
+				default: return NOT();
+			}
+		}
+		Float f = (Float) args[0];
+		switch (name) {
+			case "intValue": return f.intValue();
+			case "longValue": return f.longValue();
+			case "floatValue": return f;
+			case "doubleValue": return f.doubleValue();
+			case "isNaN": return f.isNaN() ? 1 : 0;
+			case "toString": return f.toString();
+			case "equals": return f.equals(args[1]) ? 1 : 0;
+			default: return NOT();
+		}
+	}
+
+	private static Object doubleBuiltin(String name, String desc, Object[] args, int kind) {
+		if (kind == 1) {
+			switch (name) {
+				case "doubleToLongBits": return Double.doubleToLongBits((Double) args[0]);
+				case "longBitsToDouble": return Double.longBitsToDouble((Long) args[0]);
+				case "isNaN": return Double.isNaN((Double) args[0]) ? 1 : 0;
+				case "toString": return Double.toString((Double) args[0]);
+				case "parseDouble": return Double.parseDouble((String) args[0]);
+				default: return NOT();
+			}
+		}
+		Double d = (Double) args[0];
+		switch (name) {
+			case "intValue": return d.intValue();
+			case "longValue": return d.longValue();
+			case "floatValue": return d.floatValue();
+			case "doubleValue": return d;
+			case "isNaN": return d.isNaN() ? 1 : 0;
+			case "toString": return d.toString();
+			case "equals": return d.equals(args[1]) ? 1 : 0;
+			default: return NOT();
+		}
+	}
+
+	private static Object isBuiltin(String name, String desc, Object[] args)
+			throws java.io.IOException {
+		java.io.InputStream in = (java.io.InputStream) args[0];
+		switch (name) {
+			case "read":
+				if (desc.equals("()I")) return in.read();
+				if (desc.equals("([B)I")) return in.read((byte[]) args[1]);
+				return in.read((byte[]) args[1], (Integer) args[2], (Integer) args[3]);
+			case "skip": return in.skip((Long) args[1]);
+			case "available": return in.available();
+			case "close": in.close(); return null;
+			case "mark": in.mark((Integer) args[1]); return null;
+			case "reset": in.reset(); return null;
+			case "markSupported": return in.markSupported() ? 1 : 0;
+			default: return NOT();
+		}
+	}
+
+	private static Object disBuiltin(String name, String desc, Object[] args)
+			throws java.io.IOException {
+		java.io.DataInputStream d = (java.io.DataInputStream) args[0];
+		switch (name) {
+			case "read":
+				if (desc.equals("()I")) return d.read();
+				if (desc.equals("([B)I")) return d.read((byte[]) args[1]);
+				return d.read((byte[]) args[1], (Integer) args[2], (Integer) args[3]);
+			case "readInt": return d.readInt();
+			case "readShort": return (int) d.readShort();
+			case "readByte": return (int) d.readByte();
+			case "readChar": return (int) d.readChar();
+			case "readLong": return d.readLong();
+			case "readFloat": return d.readFloat();
+			case "readDouble": return d.readDouble();
+			case "readBoolean": return d.readBoolean() ? 1 : 0;
+			case "readUnsignedByte": return d.readUnsignedByte();
+			case "readUnsignedShort": return d.readUnsignedShort();
+			case "readUTF": return d.readUTF();
+			case "readLine": return d.readLine();
+			case "readFully":
+				if (desc.equals("([B)V")) d.readFully((byte[]) args[1]);
+				else d.readFully((byte[]) args[1], (Integer) args[2], (Integer) args[3]);
+				return null;
+			case "skipBytes": return d.skipBytes((Integer) args[1]);
+			case "skip": return d.skip((Long) args[1]);
+			case "available": return d.available();
+			case "close": d.close(); return null;
+			case "mark": d.mark((Integer) args[1]); return null;
+			case "reset": d.reset(); return null;
+			case "markSupported": return d.markSupported() ? 1 : 0;
+			default: return NOT();
+		}
 	}
 
 	// ---------- field access (used by Interpreter) ----------

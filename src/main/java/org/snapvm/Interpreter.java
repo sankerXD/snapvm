@@ -160,23 +160,25 @@ public final class Interpreter {
 	private static void invoke(Vm vm, VmThread t, Frame f, ClassFile.Ref r, int pc, int oplen,
 			int kind) {
 		if (TRACE_CALLS != null
-				&& (r.owner + "." + r.name + r.desc).matches(TRACE_CALLS)
+				&& traceMatches(r.owner + "." + r.name + r.desc)
 				&& TRACE_SEEN.add("C" + r.owner + "." + r.name + r.desc
 						+ "<-" + f.owner.name + "." + f.method.name + "@" + pc))
 			System.err.println("GuestCall " + r.owner + "." + r.name + r.desc
 					+ " from " + f.owner.name + "." + f.method.name + "@" + pc);
-		VmClass owner = vm.resolveClass(r.owner);
+		VmClass owner = r.ownerClass;
+		if (owner == null)
+			r.ownerClass = owner = vm.resolveClass(r.owner);
 		if (kind == 1) {
 			if (owner.host) {
-				Object[] args = popToArray(f, r.desc, false);
+				Object[] args = popToArray(f, r, false);
 				Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 1);
 				f.pc = pc + oplen;
-				pushRet(f, r.desc, ret);
+				pushRet(f, r, ret);
 				return;
 			}
 			if (!vm.ensureInit(owner, t))
 				return; // clinit frame pushed: retry instruction next step
-			ClassFile.Method m = owner.findDeclared(r.name, r.desc);
+			ClassFile.Method m = owner.findDeclared(r.key());
 			if (m == null)
 				throw new VmException(new NoSuchMethodError(owner.name + "." + r.name + r.desc));
 			if (m.code == null)
@@ -188,16 +190,16 @@ public final class Interpreter {
 				if (!vm.monEnter(t, syncOn))
 					return; // park; the whole invoke retries on wake
 			}
-			pushGuestFrame(t, f, decl, m, r.desc, pc, oplen, false, syncOn);
+			pushGuestFrame(t, f, decl, m, r, pc, oplen, false, syncOn);
 			return;
 		}
 
-		Object recv = f.stack[f.sp - VmClass.argSlots(r.desc) - 1];
+		Object recv = f.stack[f.sp - r.argSlots() - 1];
 		if (kind == 2) {
 			// invokespecial
 			if (recv instanceof HostBridge.NewMarker) {
 				HostBridge.NewMarker mk = (HostBridge.NewMarker) recv;
-				Object[] args = popToArray(f, r.desc, false);
+				Object[] args = popToArray(f, r, false);
 				f.sp--; // pop marker
 				Object built = vm.bridge.call(t, mk.cls.name, "<init>", r.desc, args, 3);
 				replaceMarker(t, mk, built);
@@ -210,7 +212,7 @@ public final class Interpreter {
 				if (r.name.equals("<init>") && recv instanceof VmObject) {
 					// host superclass constructor: manifests the adapter shadow
 					// (its own ctor runs the real host super-ctor)
-					Object[] initArgs = popToArray(f, r.desc, true);
+					Object[] initArgs = popToArray(f, r, true);
 					VmObject g = (VmObject) recv;
 					vm.constructShadow(g, owner);
 					if (g.superCtorArgs == null)
@@ -221,17 +223,17 @@ public final class Interpreter {
 					f.pc = pc + oplen;
 					return;
 				}
-				Object[] args = popToArray(f, r.desc, true);
+				Object[] args = popToArray(f, r, true);
 				Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 2);
 				f.pc = pc + oplen;
-				pushRet(f, r.desc, ret);
+				pushRet(f, r, ret);
 				return;
 			}
 			// <init> is not inherited — supers walk would run a parent's ctor
 			// under this class's constant pool; plain invokespecial does walk
 			ClassFile.Method m = r.name.equals("<init>")
-					? owner.declaredMethods.get(r.name + "|" + r.desc)
-					: owner.findDeclared(r.name, r.desc);
+					? owner.declaredMethods.get(r.key())
+					: owner.findDeclared(r.key());
 			if (m == null || m.code == null)
 				throw new VmException(new AbstractMethodError(owner.name + "." + r.name));
 			Object syncOn = null;
@@ -240,7 +242,7 @@ public final class Interpreter {
 				if (!vm.monEnter(t, syncOn))
 					return; // park; the whole invoke retries on wake
 			}
-			pushGuestFrame(t, f, declaring(owner, m), m, r.desc, pc, oplen, true, syncOn);
+			pushGuestFrame(t, f, declaring(owner, m), m, r, pc, oplen, true, syncOn);
 			return;
 		}
 
@@ -289,24 +291,37 @@ public final class Interpreter {
 						+ " stack:" + st
 						+ chain);
 			}
-			Object[] args = popToArray(f, r.desc, true);
+			Object[] args = popToArray(f, r, true);
 			Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 0);
 			f.pc = pc + oplen;
-			pushRet(f, r.desc, ret);
+			pushRet(f, r, ret);
 			return;
 		}
 		VmClass rc = ((VmObject) recv).clazz;
-		ClassFile.Method m = rc.findMethod(r.name, r.desc);
+		// monomorphic inline cache: virtual sites in game loops almost always
+		// see one receiver class — skip the merged-table lookup on repeat hits
+		ClassFile.Method m;
+		VmClass decl;
+		if (rc == r.cacheRecv) {
+			m = r.cacheMethod;
+			decl = r.cacheDecl;
+		} else {
+			m = rc.findMethod(r.key());
+			decl = m == null ? null : declaring(rc, m);
+			r.cacheRecv = rc;
+			r.cacheMethod = m;
+			r.cacheDecl = decl;
+		}
 		if (m != null && m.code == null)
 			throw new VmException(new AbstractMethodError(rc.name + "." + r.name));
 		if (m == null) {
 			// falls back to a host method (superclass boundary or Object.*) not overridden
 			VmClass hb = rc.hostBoundary();
-			Object[] args = popToArray(f, r.desc, true);
+			Object[] args = popToArray(f, r, true);
 			Object ret = vm.bridge.call(t, hb != null ? hb.name : "java/lang/Object",
 					r.name, r.desc, args, 0);
 			f.pc = pc + oplen;
-			pushRet(f, r.desc, ret);
+			pushRet(f, r, ret);
 			return;
 		}
 		Object syncOn = null;
@@ -315,7 +330,7 @@ public final class Interpreter {
 			if (!vm.monEnter(t, syncOn))
 				return; // park; the whole invoke retries on wake
 		}
-		pushGuestFrame(t, f, declaring(rc, m), m, r.desc, pc, oplen, true, syncOn);
+		pushGuestFrame(t, f, decl, m, r, pc, oplen, true, syncOn);
 	}
 
 	private static VmClass declaring(VmClass start, ClassFile.Method m) {
@@ -325,25 +340,25 @@ public final class Interpreter {
 		return start;
 	}
 
-	private static void pushRet(Frame f, String desc, Object ret) {
-		String rt = VmClass.returnType(desc);
-		if (!rt.equals("V")) {
+	private static void pushRet(Frame f, ClassFile.Ref r, Object ret) {
+		int k = r.retKind();
+		if (k != 0) {
 			f.stack[f.sp++] = ret;
-			if (VmClass.isWide(rt))
+			if (k == 2)
 				f.stack[f.sp++] = Frame.WIDE;
 		}
 	}
 
 	private static void pushGuestFrame(VmThread t, Frame caller, VmClass decl,
-			ClassFile.Method m, String desc, int pc, int oplen, boolean hasThis,
+			ClassFile.Method m, ClassFile.Ref r, int pc, int oplen, boolean hasThis,
 			Object syncOn) {
-		Object[] args = popToArray(caller, desc, hasThis);
+		Object[] args = popToArray(caller, r, hasThis);
 		caller.pc = pc + oplen;
 		caller.callPc = pc;
-		Frame nf = new Frame(decl, m);
+		Frame nf = t.vm.allocFrame(decl, m);
 		nf.fromCall = true;
 		nf.syncOn = syncOn;
-		Vm.fillArgs(nf, desc, args, hasThis);
+		Vm.fillArgs(nf, r.desc, args, hasThis);
 		t.frames.add(nf);
 	}
 
@@ -353,10 +368,11 @@ public final class Interpreter {
 		if (f.syncOn != null)
 			t.vm.monExit(t, f.syncOn);
 		finishClinitIfNeeded(f);
+		t.vm.freeFrame(f);
 	}
 
-	private static Object[] popToArray(Frame f, String desc, boolean hasThis) {
-		int n = VmClass.countArgs(desc) + (hasThis ? 1 : 0);
+	private static Object[] popToArray(Frame f, ClassFile.Ref r, boolean hasThis) {
+		int n = r.argCount() + (hasThis ? 1 : 0);
 		Object[] a = new Object[n];
 		for (int i = n - 1; i >= 0; i--) {
 			Object v = f.stack[--f.sp];
@@ -382,7 +398,9 @@ public final class Interpreter {
 
 	private static void getPutStatic(Vm vm, VmThread t, Frame f, ClassFile.Ref r, int pc,
 			boolean isPut) {
-		VmClass owner = vm.resolveClass(r.owner);
+		VmClass owner = r.ownerClass;
+		if (owner == null)
+			r.ownerClass = owner = vm.resolveClass(r.owner);
 		if (owner.host) {
 			if (isPut) {
 				Object v = f.stack[--f.sp];
@@ -399,10 +417,16 @@ public final class Interpreter {
 		}
 		if (!vm.ensureInit(owner, t))
 			return; // clinit pushed; retry
-		VmClass decl = owner.staticFieldOwner(r.name, r.desc);
-		if (decl == null)
-			throw new VmException(new NoSuchFieldError(r.owner + "." + r.name));
-		int slot = decl.ownStaticSlot(r.name, r.desc);
+		VmClass decl = r.staticOwner;
+		int slot = r.staticSlot;
+		if (decl == null) {
+			decl = owner.staticFieldOwner(r.name, r.desc);
+			if (decl == null)
+				throw new VmException(new NoSuchFieldError(r.owner + "." + r.name));
+			slot = decl.ownStaticSlot(r.name, r.desc);
+			r.staticOwner = decl;
+			r.staticSlot = slot;
+		}
 		if (isPut) {
 			Object v = f.stack[--f.sp];
 			if (v == Frame.WIDE)
@@ -426,11 +450,7 @@ public final class Interpreter {
 			if (recv == null)
 				throw new VmException(new NullPointerException());
 			if (recv instanceof VmObject) {
-				VmClass owner = vm.resolveClass(r.owner);
-				Integer slot = owner.fieldSlot(r.name, r.desc);
-				if (slot == null)
-					throw new VmException(new NoSuchFieldError(r.name));
-				((VmObject) recv).fields[slot] = v;
+				((VmObject) recv).fields[guestSlot(vm, r)] = v;
 			} else {
 				vm.bridge.putField(recv, r, v);
 			}
@@ -442,11 +462,7 @@ public final class Interpreter {
 			throw new VmException(new NullPointerException());
 		Object v;
 		if (recv instanceof VmObject) {
-			VmClass owner = vm.resolveClass(r.owner);
-			Integer slot = owner.fieldSlot(r.name, r.desc);
-			if (slot == null)
-				throw new VmException(new NoSuchFieldError(r.name));
-			v = ((VmObject) recv).fields[slot];
+			v = ((VmObject) recv).fields[guestSlot(vm, r)];
 		} else {
 			v = vm.bridge.getField(recv, r);
 		}
@@ -454,6 +470,21 @@ public final class Interpreter {
 		if (VmClass.isWide(r.desc))
 			f.stack[f.sp++] = Frame.WIDE;
 		f.pc = pc + 3;
+	}
+
+	/** flattened field slot for a guest-class field ref, cached on the Ref. */
+	private static int guestSlot(Vm vm, ClassFile.Ref r) {
+		int slot = r.fieldSlot;
+		if (slot < 0) {
+			VmClass owner = r.ownerClass;
+			if (owner == null)
+				r.ownerClass = owner = vm.resolveClass(r.owner);
+			Integer s = owner.fieldSlot(r.name, r.desc);
+			if (s == null)
+				throw new VmException(new NoSuchFieldError(r.name));
+			r.fieldSlot = slot = s;
+		}
+		return slot;
 	}
 
 	// ---------- helpers ----------
@@ -493,8 +524,18 @@ public final class Interpreter {
 	public static volatile boolean TRACE = false;
 	public static volatile boolean TRACE_THROWS = false;
 	public static volatile String TRACE_CALLS = null;
+	private static volatile java.util.regex.Pattern traceCallsPattern;
 	private static final java.util.Set<String> TRACE_SEEN =
 			java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+	private static boolean traceMatches(String sig) {
+		String rx = TRACE_CALLS;
+		if (rx == null)
+			return false;
+		if (traceCallsPattern == null || !traceCallsPattern.pattern().equals(rx))
+			traceCallsPattern = java.util.regex.Pattern.compile(rx);
+		return traceCallsPattern.matcher(sig).matches();
+	}
 
 	private static void step(Vm vm, VmThread t, Frame f) {
 		byte[] code = f.method.code.code;
@@ -666,10 +707,11 @@ public final class Interpreter {
 						st[sp] = v; st[sp + 1] = Frame.WIDE; sp += 2;
 					}
 				} else if (st[sp - 3] == Frame.WIDE) { // two singles over wide
-					Object c = st[sp - 1], b = st[sp - 2], v = st[sp - 5];
-					st[sp - 5] = b; st[sp - 4] = c;
-					st[sp - 3] = v; st[sp - 2] = Frame.WIDE;
-					st[sp - 1] = b; st[sp] = c; sp += 2;
+					// [.., w, WIDE, a, b] -> [.., a, b, w, WIDE, a, b]
+					Object b = st[sp - 1], a = st[sp - 2], w = st[sp - 4];
+					st[sp - 4] = a; st[sp - 3] = b;
+					st[sp - 2] = w; st[sp - 1] = Frame.WIDE;
+					st[sp] = a; st[sp + 1] = b; sp += 2;
 				} else { // two singles over two singles
 					Object d = st[sp - 1], c = st[sp - 2], b = st[sp - 3], a = st[sp - 4];
 					st[sp - 4] = c; st[sp - 3] = d; st[sp - 2] = a; st[sp - 1] = b;
@@ -711,11 +753,11 @@ public final class Interpreter {
 			case 0x77: st[sp - 2] = -(Double) st[sp - 2]; break;
 			// shifts
 			case 0x78: st[sp - 2] = (Integer) st[sp - 2] << (Integer) st[sp - 1]; sp--; break;
-			case 0x79: st[sp - 3] = (Long) st[sp - 3] << (Integer) st[sp - 1]; sp -= 2; break;
+			case 0x79: st[sp - 3] = (Long) st[sp - 3] << (Integer) st[sp - 1]; sp--; break;
 			case 0x7a: st[sp - 2] = (Integer) st[sp - 2] >> (Integer) st[sp - 1]; sp--; break;
-			case 0x7b: st[sp - 3] = (Long) st[sp - 3] >> (Integer) st[sp - 1]; sp -= 2; break;
+			case 0x7b: st[sp - 3] = (Long) st[sp - 3] >> (Integer) st[sp - 1]; sp--; break;
 			case 0x7c: st[sp - 2] = (Integer) st[sp - 2] >>> (Integer) st[sp - 1]; sp--; break;
-			case 0x7d: st[sp - 3] = (Long) st[sp - 3] >>> (Integer) st[sp - 1]; sp -= 2; break;
+			case 0x7d: st[sp - 3] = (Long) st[sp - 3] >>> (Integer) st[sp - 1]; sp--; break;
 			// logic
 			case 0x7e: st[sp - 2] = (Integer) st[sp - 2] & (Integer) st[sp - 1]; sp--; break;
 			case 0x7f: st[sp - 4] = (Long) st[sp - 4] & (Long) st[sp - 2]; sp -= 2; break;
@@ -970,8 +1012,10 @@ public final class Interpreter {
 			return;
 		}
 		t.nestedResult = ret;
-		Frame caller = t.top();
-		caller.stack[caller.sp++] = ret;
+		if (!f.external) {
+			Frame caller = t.top();
+			caller.stack[caller.sp++] = ret;
+		}
 	}
 
 	private static void doReturnWide(VmThread t, Frame f) {
@@ -983,9 +1027,11 @@ public final class Interpreter {
 			return;
 		}
 		t.nestedResult = ret;
-		Frame caller = t.top();
-		caller.stack[caller.sp++] = ret;
-		caller.stack[caller.sp++] = Frame.WIDE;
+		if (!f.external) {
+			Frame caller = t.top();
+			caller.stack[caller.sp++] = ret;
+			caller.stack[caller.sp++] = Frame.WIDE;
+		}
 	}
 
 	private static void doReturnVoid(VmThread t) {

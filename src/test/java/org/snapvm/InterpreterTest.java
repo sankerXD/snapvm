@@ -162,6 +162,23 @@ public class InterpreterTest {
 	}
 
 	/**
+	 * lshl/lshr/lushr consumed [L,WIDE,int] (3 slots) but popped 2 — the
+	 * result kept no WIDE slot and the next long op threw
+	 * ClassCastException (or silently misread the stack). Found via
+	 * 宠物王国6: CWA2DAPI.CWATools.getBytes does (J >> s) & 0xFF in a loop.
+	 */
+	@Test
+	public void longShiftsKeepWide() throws Exception {
+		long x = -1991225785L;
+		long expected = ((x << 3) >>> 8) + (x >> 24) + (x >>> 4);
+		Vm vm = vm(compile(
+				"public class Lw { public static long go() {"
+						+ " long x = -1991225785L;"
+						+ " return ((x << 3) >>> 8) + (x >> 24) + (x >>> 4); } }"));
+		assertEquals(expected, ((Long) vm.invokeStatic("Lw", "go", "()J")).longValue());
+	}
+
+	/**
 	 * pop2 over TWO single-slot values must drop both. An obfuscated J2ME game
 	 * (M3 burn-in) used `getstatic array; arraylength; pop2` inside an argument
 	 * list — the residue shifted every following argument one slot, so the
@@ -201,6 +218,69 @@ public class InterpreterTest {
 				"public class PW { static long big() { return 123456789012L; }"
 						+ " public static int go() { big(); return 7; } }"));
 		assertEquals(7, run(vm, "PW", "go"));
+	}
+
+	/**
+	 * dup2_x2 with two single-slot values over a wide pair: stack
+	 * [wide,W,a,b] must become [a,b,wide,W,a,b]. The buggy code read the
+	 * wide value from sp-5 (one slot below the pair) and wrote b at sp-5 —
+	 * with exactly 4 stack slots that alone is index -1; deeper stacks
+	 * silently scrambled the duplicated pair. Produces the value via
+	 * iadd on the duplicated singles, and stores the long to prove it
+	 * landed back intact and in position.
+	 */
+	@Test
+	public void dup2x2TwoSinglesOverWide() throws Exception {
+		Map<String, byte[]> classes = compile(
+				"public class D2X2 { static long big() { return 0x11223344L; }"
+						+ " public static int go() { return 0; } }");
+		Vm vm = vm(classes);
+		VmClass vc = vm.resolveClass("D2X2");
+		ClassFile.Method m = vc.declaredMethods.get("go|()I");
+		m.code.code = new byte[] {
+				0x14, 0, 2,                    // ldc2_w #2 -> long constant (patched below)
+				0x10, 11,                      // bipush 11  -> a
+				0x10, 22,                      // bipush 22  -> b
+				0x5e,                          // dup2_x2: [a,b,L,W,a,b]
+				0x58,                          // pop2 -> [a,b,L,W]
+				0x3f,                          // lstore_0 (locals 0,1 = L)
+				0x60,                          // iadd -> a+b = 33
+				(byte) 0xac                    // ireturn
+		};
+		m.code.maxStack = 8;
+		m.code.maxLocals = 2;
+		// patch ldc2_w cp index to the long constant the compiler emitted for big()
+		int longCp = -1;
+		for (int i = 1; i < 200; i++) {
+			try {
+				if (vc.cf.cpTag(i) == 5) { longCp = i; break; } // CONSTANT_Long
+			} catch (Exception e) {
+				break;
+			}
+		}
+		assertTrue("no long cp entry", longCp > 0);
+		m.code.code[1] = (byte) (longCp >> 8);
+		m.code.code[2] = (byte) longCp;
+		assertEquals(33, run(vm, "D2X2", "go"));
+	}
+
+	/**
+	 * Micro-benchmark, not a correctness test: tight int loop gives a rough
+	 * instructions/sec figure for this host. Useful when judging whether a
+	 * real game is compute-bound under the interpreter.
+	 */
+	@Test
+	public void benchIntLoop() throws Exception {
+		Vm vm = vm(compile(
+				"public class B { public static int go() {"
+						+ " int s = 0;"
+						+ " for (int i = 0; i < 3000000; i++) { s += i; s ^= i; s += 7; }"
+						+ " return s; } }"));
+		long t0 = System.nanoTime();
+		Object r = vm.invokeStatic("B", "go", "()I");
+		long dt = System.nanoTime() - t0;
+		System.out.println("benchIntLoop: " + r + " in " + dt / 1000000 + " ms"
+				+ " (~" + (3_000_000L * 8 * 1000 / Math.max(1, dt / 1000000)) + " ops/s est)");
 	}
 
 	/**
@@ -305,6 +385,50 @@ public class InterpreterTest {
 		midlet.pause();
 		midlet.destroy(true);
 		assertEquals(16 | 1 | 8 | 2 | 4, vm.invokeStatic("GameMidlet", "probe", "()I"));
+	}
+
+	/** Shadow for guest-extends-TimerTask: a real host TimerTask forwarding run(). */
+	public static class TimerShadow extends java.util.TimerTask {
+		private final Vm vm;
+		private final VmObject guest;
+
+		TimerShadow(Vm vm, VmObject guest) {
+			this.vm = vm;
+			this.guest = guest;
+		}
+
+		public void run() {
+			vm.callFromHost(guest, "run", "()V");
+		}
+	}
+
+	/** Guest extends java.util.TimerTask: shadow created at super-<init>,
+	 * guest object marshals to the shadow for Timer.schedule, the host Timer's
+	 * own thread calls run() back into the guest, cancel() reaches the shadow. */
+	@Test
+	public void timerTaskShadow() throws Exception {
+		Vm vm = vm(compile(
+				"public class Tt {"
+						+ " public static int fired;"
+						+ " public static class Task extends java.util.TimerTask {"
+						+ "  public void run() { fired = 1; }"
+						+ " }"
+						+ " public static int go() {"
+						+ "  Task t = new Task();"
+						+ "  java.util.Timer timer = new java.util.Timer();"
+						+ "  timer.schedule(t, 10);"
+						+ "  Task dead = new Task();"
+						+ "  dead.cancel();"
+						+ "  try { Thread.sleep(300); } catch (InterruptedException e) {}"
+						+ "  timer.cancel();"
+						+ "  return fired;"
+						+ " } }"));
+		vm.registerShadow(java.util.TimerTask.class, new Vm.ShadowFactory() {
+			public Object create(Vm vm, VmObject guest) {
+				return new TimerShadow(vm, guest);
+			}
+		});
+		assertEquals(1, run(vm, "Tt", "go"));
 	}
 
 	/** Two green threads: wait() blocks, releases the monitor, notify() wakes it. */
@@ -709,5 +833,79 @@ public class InterpreterTest {
 			}
 		});
 		assertEquals(742, run(vm, "Rs", "go"));
+	}
+
+	/**
+	 * The JDK fast-paths (Vector/StringBuffer/String/Math/IO) must behave
+	 * identically to the reflective route — same results, same exceptions.
+	 */
+	@Test
+	public void fastBuiltins() throws Exception {
+		Vm vm = vm(compile(
+				"import java.util.Vector;\n"
+						+ "import java.util.Hashtable;\n"
+						+ "import java.util.Enumeration;\n"
+						+ "public class Fb { static class Greet {"
+						+ "  public String toString() { return \"hi-42\"; } }"
+						+ "public static int go() {"
+						+ "  Vector v = new Vector();"
+						+ "  for (int i = 0; i < 5; i++) v.addElement(\"s\" + i);"
+						+ "  int sum = 0;"
+						+ "  for (int i = 0; i < v.size(); i++)"
+						+ "    sum += ((String) v.elementAt(i)).length();"   // +10
+						+ "  StringBuffer sb = new StringBuffer();"
+						+ "  sb.append(\"ab\").append(12).append('c').append(true);"
+						+ "  String s = sb.toString();"                    // "ab12ctrue"
+						+ "  sum += s.length() + s.indexOf(\"12\") + s.substring(2).length();" // +9+2+7
+						+ "  Enumeration e = v.elements(); int n = 0;"
+						+ "  while (e.hasMoreElements()) { e.nextElement(); n++; }" // n=5
+						+ "  Hashtable h = new Hashtable(); h.put(\"k\", Integer.valueOf(7));"
+						+ "  sum += n + h.size() + ((Integer) h.get(\"k\")).intValue();" // +13
+						+ "  sum += Math.max(3, 9) + Math.min(4, 2);"       // +11
+						+ "  sum += Integer.parseInt(\"31\");"              // +31
+						+ "  byte[] raw = {0,0,0,5};"
+						+ "  java.io.DataInputStream dis = new java.io.DataInputStream("
+						+ "      new java.io.ByteArrayInputStream(raw));"
+						+ "  try { sum += dis.readInt(); dis.close(); }"
+						+ "  catch (java.io.IOException ex) { return -99; }" // +5
+						+ "  v.removeElementAt(0);"
+						+ "  sum += v.size() * 100;"                        // +400
+						// guest objects marshaled into host String APIs must
+						// run their own toString — "hi-42".length() = 5
+						+ "  sum += String.valueOf(new Greet()).length()"   // +5
+						+ "       + new String(new StringBuffer(\"xy\")).length();" // +2
+						+ "  return sum;"                                   // 495
+						+ " } }"));
+		assertEquals(495, run(vm, "Fb", "go"));
+	}
+
+	@Test
+	public void stringMarshalGuest() throws Exception {
+		Vm vm = vm(compile(
+				"public class Sg { static class G { public String toString() { return \"hi-42\"; } }"
+						+ "public static int a() { return String.valueOf(new G()).length(); }"
+						+ "public static int b() { return new String(new StringBuffer(\"xy\")).length(); }"
+						+ "public static int c() { return String.valueOf(new G()).length()"
+						+ "    + new String(new StringBuffer(\"xy\")).length(); }"
+						+ " }"));
+		assertEquals(5, run(vm, "Sg", "a"));
+		assertEquals(2, run(vm, "Sg", "b"));
+		assertEquals(7, run(vm, "Sg", "c"));
+	}
+
+	/** Host-call dispatch throughput: Vector.size() in a guest loop. */
+	@Test
+	public void benchHostCall() throws Exception {
+		Vm vm = vm(compile(
+				"public class Bc { public static int go() {"
+						+ "  java.util.Vector v = new java.util.Vector();"
+						+ "  int s = 0;"
+						+ "  for (int i = 0; i < 100000; i++) s += v.size();"
+						+ "  return s; } }"));
+		long t0 = System.nanoTime();
+		assertEquals(0, run(vm, "Bc", "go"));
+		long ms = (System.nanoTime() - t0) / 1_000_000;
+		System.out.println("benchHostCall: 100000 calls in " + ms + " ms (~"
+				+ (100000000 / Math.max(1, ms)) + " calls/s)");
 	}
 }
