@@ -66,3 +66,14 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     locals + operand stack + the whole guest frame chain to stderr before
     host dispatch would mask it as "host class missing". This is how the
     pop2 corruption was localized to `c.l.b`'s locals in one shot.
+  - `executor`/`executorThread` are now held ONLY for the duration of
+    `Interpreter.execute` (helper `runSlice`), restored in finally.
+    Previously pump() bound executorThread for its whole body and
+    runUntilDone across park waits, and a VmError escaping execute skipped
+    the restore — a stale `executorThread==current && executor==null` pair
+    made every later callFromHost on that thread NPE on `cur.frames`, and
+    the caller (JL-Modern CanvasEvent) swallowed it: keyReleased/paint
+    callbacks vanished → stuck fire/runaway movement/latency on device.
+    callFromHost also falls back to the fresh-thread path if executor is
+    null. Test: `callFromHostWithStaleExecutorThread` (reflection-poisons
+    the pair, proves delivery instead of NPE).
