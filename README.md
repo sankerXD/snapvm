@@ -12,7 +12,7 @@ cannot snapshot code running directly on ART/HotSpot, so you interpret it
 yourself instead.
 
 Originally built to replace the dex→ART execution core of
-[JL-Mod-Modern](https://github.com/sankerXD/JL-Mod-Modern) (a J2ME emulator for
+[JL-Modern](https://github.com/sankerXD/JL-Modern) (a J2ME emulator for
 Android handhelds), where it will give 500+ retro Java games real save states.
 
 ## How it works

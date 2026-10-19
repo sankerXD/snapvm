@@ -1,7 +1,7 @@
 # AGENTS.md — snapvm maintainer notes
 
 Standalone, dependency-free Java bytecode interpreter designed for
-serializable VM state (snapshots). Consumed by JL-Mod-Modern as its future
+serializable VM state (snapshots). Consumed by JL-Modern as its future
 execution core; kept as an independent repo so the wider J2ME/emulation
 community can embed it.
 
@@ -41,7 +41,7 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
 
 ## History notes
 
-- Written from scratch for JL-Mod-Modern (Oct 2025). SquirrelJME's SpringCoat
+- Written from scratch for JL-Modern (Oct 2025). SquirrelJME's SpringCoat
   was studied as an architectural reference (object-graph VM state) but no code
   was copied.
 - M3 real-game fixes (Oct 2025):
