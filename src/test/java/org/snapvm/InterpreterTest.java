@@ -261,7 +261,7 @@ public class InterpreterTest {
 		assertTrue("no long cp entry", longCp > 0);
 		m.code.code[1] = (byte) (longCp >> 8);
 		m.code.code[2] = (byte) longCp;
-		assertEquals(33, run(vm, "D2X2", "go"));
+assertEquals(33, run(vm, "D2X2", "go"));
 	}
 
 	/**
@@ -512,7 +512,7 @@ public class InterpreterTest {
 						+ "  t.join();"
 						+ "  return inside;"   // 1000 + 1
 						+ " } }"));
-		assertEquals(1001, run(vm, "Sm", "go"));
+assertEquals(1001, run(vm, "Sm", "go"));
 	}
 
 	/** A guest class extending host Thread: start() launches run() as a green thread. */

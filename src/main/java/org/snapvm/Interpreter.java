@@ -36,9 +36,9 @@ public final class Interpreter {
 			}
 			if (depth >= 0 && t.frames.size() <= depth)
 				break;
-			used++;
 			try {
-				step(vm, t, f);
+				used += step(vm, t, f,
+						(int) Math.min(budget - used, Integer.MAX_VALUE), depth);
 			} catch (VmException e) {
 				throwObject(vm, t, e.thrown);
 			} catch (RuntimeException e) {
@@ -537,13 +537,21 @@ public final class Interpreter {
 		return traceCallsPattern.matcher(sig).matches();
 	}
 
-	private static void step(Vm vm, VmThread t, Frame f) {
+	private static int step(Vm vm, VmThread t, Frame f, int remaining, int depth) {
 		byte[] code = f.method.code.code;
 		ClassFile cf = f.owner.cf;
 		int pc = f.pc;
-		int op = code[pc] & 0xff;
 		Object[] st = f.stack, lo = f.locals;
 		int sp = f.sp;
+		int used = 0;
+		for (;;) {
+		if (used >= remaining) {
+			f.pc = pc; f.sp = sp;
+			return used;
+		}
+		int op = code[pc] & 0xff;
+		used++;
+		f.pc = pc; // exception paths + helpers read the current insn pc
 		f.sp = sp; // keep frame in sync for helpers that use f.sp directly
 		if (TRACE)
 			System.err.printf("%-24s pc=%-4d op=%02x sp=%d stack=%s%n",
@@ -552,7 +560,7 @@ public final class Interpreter {
 
 		switch (op) {
 			// const
-			case 0x00: f.pc = pc + 1; return;
+			case 0x00: pc++; continue;
 			case 0x01: st[sp++] = null; break;
 			case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
 				st[sp++] = op - 0x03; break;
@@ -562,19 +570,19 @@ public final class Interpreter {
 				st[sp++] = (float) (op - 0x0b); break;
 			case 0x0e: case 0x0f:
 				st[sp++] = (double) (op - 0x0e); st[sp++] = Frame.WIDE; break;
-			case 0x10: st[sp++] = (int) code[pc + 1]; f.pc = pc + 2; f.sp = sp; return;
-			case 0x11: st[sp++] = s2(code, pc + 1); f.pc = pc + 3; f.sp = sp; return;
-			case 0x12: f.sp = sp; ldc(vm, f, cf, code[pc + 1] & 0xff); f.pc = pc + 2; return;
-			case 0x13: f.sp = sp; ldc(vm, f, cf, u2(code, pc + 1)); f.pc = pc + 3; return;
+			case 0x10: st[sp++] = (int) code[pc + 1]; pc += 2; continue;
+			case 0x11: st[sp++] = s2(code, pc + 1); pc += 3; continue;
+			case 0x12: f.sp = sp; ldc(vm, f, cf, code[pc + 1] & 0xff); sp = f.sp; pc += 2; continue;
+			case 0x13: f.sp = sp; ldc(vm, f, cf, u2(code, pc + 1)); sp = f.sp; pc += 3; continue;
 			case 0x14:
 				st[sp++] = cf.cpValue(u2(code, pc + 1)); st[sp++] = Frame.WIDE;
-				f.pc = pc + 3; f.sp = sp; return;
+				pc += 3; continue;
 			// xload n
 			case 0x15: case 0x17: case 0x19:
-				st[sp++] = lo[code[pc + 1] & 0xff]; f.pc = pc + 2; f.sp = sp; return;
+				st[sp++] = lo[code[pc + 1] & 0xff]; pc += 2; continue;
 			case 0x16: case 0x18:
 				st[sp++] = lo[code[pc + 1] & 0xff]; st[sp++] = Frame.WIDE;
-				f.pc = pc + 2; f.sp = sp; return;
+				pc += 2; continue;
 			// xload_0..3
 			case 0x1a: case 0x1b: case 0x1c: case 0x1d:
 				st[sp++] = lo[op - 0x1a]; break;
@@ -606,14 +614,14 @@ public final class Interpreter {
 			case 0x36: case 0x38: case 0x3a: {
 				int n = code[pc + 1] & 0xff;
 				lo[n] = st[--sp];
-				f.pc = pc + 2; f.sp = sp; return;
+				pc += 2; continue;
 			}
 			case 0x37: case 0x39: {
 				int n = code[pc + 1] & 0xff;
 				lo[n + 1] = Frame.WIDE;
 				lo[n] = st[sp - 2];
 				sp -= 2;
-				f.pc = pc + 2; f.sp = sp; return;
+				pc += 2; continue;
 			}
 			// xstore_0..3
 			case 0x3b: case 0x3c: case 0x3d: case 0x3e:
@@ -768,7 +776,7 @@ public final class Interpreter {
 			case 0x84: { // iinc
 				int n = code[pc + 1] & 0xff;
 				lo[n] = (Integer) lo[n] + code[pc + 2];
-				f.pc = pc + 3; f.sp = sp; return;
+				pc += 3; continue;
 			}
 			// conversions
 			case 0x85: st[sp - 1] = (long) (Integer) st[sp - 1]; insWide(st, sp); sp++; break;
@@ -802,23 +810,23 @@ public final class Interpreter {
 				int v = (Integer) st[--sp];
 				boolean go = op == 0x99 ? v == 0 : op == 0x9a ? v != 0 : op == 0x9b ? v < 0
 						: op == 0x9c ? v >= 0 : op == 0x9d ? v > 0 : v <= 0;
-				f.pc = go ? pc + s2(code, pc + 1) : pc + 3;
-				f.sp = sp; return;
+				pc = go ? pc + s2(code, pc + 1) : pc + 3;
+				continue;
 			}
 			case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: {
 				int b = (Integer) st[--sp], a = (Integer) st[--sp];
 				boolean go = op == 0x9f ? a == b : op == 0xa0 ? a != b : op == 0xa1 ? a < b
 						: op == 0xa2 ? a >= b : op == 0xa3 ? a > b : a <= b;
-				f.pc = go ? pc + s2(code, pc + 1) : pc + 3;
-				f.sp = sp; return;
+				pc = go ? pc + s2(code, pc + 1) : pc + 3;
+				continue;
 			}
 			case 0xa5: case 0xa6: {
 				Object b = st[--sp], a = st[--sp];
 				boolean go = (op == 0xa5) == (a == b);
-				f.pc = go ? pc + s2(code, pc + 1) : pc + 3;
-				f.sp = sp; return;
+				pc = go ? pc + s2(code, pc + 1) : pc + 3;
+				continue;
 			}
-			case 0xa7: f.pc = pc + s2(code, pc + 1); f.sp = sp; return;
+			case 0xa7: pc += s2(code, pc + 1); continue;
 			case 0xa8: case 0xa9:                                      // jsr/ret
 				throw new VmError("jsr/ret not supported");
 			case 0xaa: { // tableswitch
@@ -828,8 +836,8 @@ public final class Interpreter {
 				int low = s4(code, base + 4), high = s4(code, base + 8);
 				int off = (idx >= low && idx <= high)
 						? s4(code, base + 12 + (idx - low) * 4) : def;
-				f.pc = pc + off;
-				f.sp = sp; return;
+				pc += off;
+				continue;
 			}
 			case 0xab: { // lookupswitch
 				int key = (Integer) st[--sp];
@@ -843,31 +851,121 @@ public final class Interpreter {
 						break;
 					}
 				}
-				f.pc = pc + off;
-				f.sp = sp; return;
+				pc += off;
+				continue;
 			}
 			// returns
 			case 0xac: case 0xae: case 0xb0: { // ireturn/freturn/areturn
 				f.sp = sp;
 				doReturnTyped(t, f);
-				return;
+				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
+						|| (depth >= 0 && t.frames.size() <= depth))
+					return used;
+				f = t.top();
+				code = f.method.code.code;
+				cf = f.owner.cf;
+				st = f.stack; lo = f.locals;
+				sp = f.sp; pc = f.pc;
+				continue;
 			}
 			case 0xad: case 0xaf: { // lreturn/dreturn
 				f.sp = sp;
 				doReturnWide(t, f);
-				return;
+				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
+						|| (depth >= 0 && t.frames.size() <= depth))
+					return used;
+				f = t.top();
+				code = f.method.code.code;
+				cf = f.owner.cf;
+				st = f.stack; lo = f.locals;
+				sp = f.sp; pc = f.pc;
+				continue;
 			}
-			case 0xb1: f.sp = sp; doReturnVoid(t); return;
+			case 0xb1: {
+				f.sp = sp;
+				doReturnVoid(t);
+				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
+						|| (depth >= 0 && t.frames.size() <= depth))
+					return used;
+				f = t.top();
+				code = f.method.code.code;
+				cf = f.owner.cf;
+				st = f.stack; lo = f.locals;
+				sp = f.sp; pc = f.pc;
+				continue;
+			}
 			// field access
-			case 0xb2: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false); return;
-			case 0xb3: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true); return;
-			case 0xb4: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false); return;
-			case 0xb5: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true); return;
+			case 0xb2: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false);
+			if (t.top() != f) return used; // clinit frame pushed; retry after it runs
+			pc = f.pc; sp = f.sp; continue;
+			case 0xb3: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true);
+			if (t.top() != f) return used; // clinit frame pushed; retry after it runs
+			pc = f.pc; sp = f.sp; continue;
+			case 0xb4: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false);
+			pc = f.pc; sp = f.sp; continue;
+			case 0xb5: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true);
+			pc = f.pc; sp = f.sp; continue;
 			// invokes
-			case 0xb6: f.sp = sp; invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 0); return;
-			case 0xb7: f.sp = sp; invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 2); return;
-			case 0xb8: f.sp = sp; invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 1); return;
-			case 0xb9: f.sp = sp; invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 5, 0); return;
+			case 0xb6: {
+				f.sp = sp;
+				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 0);
+				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
+					return used;
+				Frame nf = t.top();
+				if (nf != f) { // guest frame pushed — switch to it inline
+					f = nf;
+					code = f.method.code.code;
+					cf = f.owner.cf;
+					st = f.stack; lo = f.locals;
+					sp = f.sp; pc = f.pc;
+				} else { pc = f.pc; sp = f.sp; }
+				continue;
+			}
+			case 0xb7: {
+				f.sp = sp;
+				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 2);
+				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
+					return used;
+				Frame nf = t.top();
+				if (nf != f) { // guest frame pushed — switch to it inline
+					f = nf;
+					code = f.method.code.code;
+					cf = f.owner.cf;
+					st = f.stack; lo = f.locals;
+					sp = f.sp; pc = f.pc;
+				} else { pc = f.pc; sp = f.sp; }
+				continue;
+			}
+			case 0xb8: {
+				f.sp = sp;
+				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 1);
+				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
+					return used;
+				Frame nf = t.top();
+				if (nf != f) { // guest frame pushed — switch to it inline
+					f = nf;
+					code = f.method.code.code;
+					cf = f.owner.cf;
+					st = f.stack; lo = f.locals;
+					sp = f.sp; pc = f.pc;
+				} else { pc = f.pc; sp = f.sp; }
+				continue;
+			}
+			case 0xb9: {
+				f.sp = sp;
+				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 5, 0);
+				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
+					return used;
+				Frame nf = t.top();
+				if (nf != f) { // guest frame pushed — switch to it inline
+					f = nf;
+					code = f.method.code.code;
+					cf = f.owner.cf;
+					st = f.stack; lo = f.locals;
+					sp = f.sp; pc = f.pc;
+				} else { pc = f.pc; sp = f.sp; }
+				continue;
+			}
 			case 0xba: throw new VmError("invokedynamic not supported");
 			// new/arrays
 			case 0xbb: { // new
@@ -875,25 +973,25 @@ public final class Interpreter {
 				if (c.host)
 					st[sp++] = new HostBridge.NewMarker(c);
 				else {
-					if (!vm.ensureInit(c, t)) { f.sp = sp; return; }
+					if (!vm.ensureInit(c, t)) { f.sp = sp; return used; }
 					st[sp++] = new VmObject(c);
 				}
-				f.pc = pc + 3;
-				f.sp = sp; return;
+				pc += 3;
+				continue;
 			}
 			case 0xbc: { // newarray
 				int n = (Integer) st[--sp];
 				int at = code[pc + 1] & 0xff;
 				st[sp++] = newPrimArray(at, n);
-				f.pc = pc + 2;
-				f.sp = sp; return;
+				pc += 2;
+				continue;
 			}
 			case 0xbd: { // anewarray
 				int n = (Integer) st[--sp];
 				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
 				st[sp++] = newObjArray(vm, c, n);
-				f.pc = pc + 3;
-				f.sp = sp; return;
+				pc += 3;
+				continue;
 			}
 			case 0xbe: { // arraylength
 				Object arr = st[--sp];
@@ -916,15 +1014,15 @@ public final class Interpreter {
 						throw new VmException(new ClassCastException(
 								o.getClass().getName() + " -> " + c.name));
 				}
-				f.pc = pc + 3;
-				f.sp = sp; return;
+				pc += 3;
+				continue;
 			}
 			case 0xc1: { // instanceof
 				Object o = st[--sp];
 				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
 				st[sp++] = o != null && c.isInstance(o) ? 1 : 0;
-				f.pc = pc + 3;
-				f.sp = sp; return;
+				pc += 3;
+				continue;
 			}
 			case 0xc2: { // monitorenter
 				Object o = st[sp - 1];
@@ -932,7 +1030,7 @@ public final class Interpreter {
 					throw new VmException(new NullPointerException());
 				if (!vm.monEnter(t, o)) {
 					f.sp = sp; // keep the ref on stack; retry instruction on wake
-					return;
+					return used;
 				}
 				sp--;
 				break;
@@ -949,8 +1047,9 @@ public final class Interpreter {
 				int n = u2(code, pc + 2);
 				if (wop == 0x84) {
 					lo[n] = (Integer) lo[n] + s2(code, pc + 4);
-					f.pc = pc + 6;
-				} else {
+					pc += 6;
+					continue;
+				}
 					// wide load/store
 					switch (wop) {
 						case 0x15: case 0x17: case 0x19:
@@ -964,11 +1063,9 @@ public final class Interpreter {
 						default:
 							throw new VmError("bad wide op " + wop);
 					}
-					f.pc = pc + 4;
+					pc += 4;
+					continue;
 				}
-				f.sp = sp;
-				return;
-			}
 			case 0xc5: { // multianewarray
 				int dims = code[pc + 3] & 0xff;
 				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
@@ -976,27 +1073,27 @@ public final class Interpreter {
 				for (int i = dims - 1; i >= 0; i--)
 					sizes[i] = (Integer) st[--sp];
 				st[sp++] = multiArray(vm, c.name, sizes, 0);
-				f.pc = pc + 4;
-				f.sp = sp; return;
+				pc += 4;
+				continue;
 			}
 			case 0xc6: { // ifnull
 				Object o = st[--sp];
-				f.pc = o == null ? pc + s2(code, pc + 1) : pc + 3;
-				f.sp = sp; return;
+				pc = o == null ? pc + s2(code, pc + 1) : pc + 3;
+				continue;
 			}
 			case 0xc7: { // ifnonnull
 				Object o = st[--sp];
-				f.pc = o != null ? pc + s2(code, pc + 1) : pc + 3;
-				f.sp = sp; return;
+				pc = o != null ? pc + s2(code, pc + 1) : pc + 3;
+				continue;
 			}
-			case 0xc8: f.pc = pc + s4(code, pc + 1); f.sp = sp; return;  // goto_w
+			case 0xc8: pc += s4(code, pc + 1); continue;  // goto_w
 			case 0xc9: throw new VmError("jsr_w not supported");
 			default:
 				throw new VmError("unimplemented opcode 0x" + Integer.toHexString(op)
 						+ " in " + f.describe());
 		}
-		f.pc = pc + 1;
-		f.sp = sp;
+		pc++; continue;
+		}
 	}
 
 	private static ClassFile.Ref ref(ClassFile cf, int idx) {
