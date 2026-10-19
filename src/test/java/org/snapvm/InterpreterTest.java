@@ -161,6 +161,48 @@ public class InterpreterTest {
 		assertEquals(3000000000L + 1200000000L, vm.invokeStatic("Ld", "go", "()J"));
 	}
 
+	/**
+	 * pop2 over TWO single-slot values must drop both. An obfuscated J2ME game
+	 * (M3 burn-in) used `getstatic array; arraylength; pop2` inside an argument
+	 * list — the residue shifted every following argument one slot, so the
+	 * callee's Lbx; parameter received Integer 0 and the next invokevirtual hit
+	 * "host class missing bx".
+	 */
+	@Test
+	public void pop2TwoSingles() throws Exception {
+		Map<String, byte[]> classes = compile(
+				"public class P2 { static int id(int x) { return x; }"
+						+ " public static int caller() { return id(77); } }");
+		Vm vm = vm(classes);
+		VmClass vc = vm.resolveClass("P2");
+		ClassFile.Method m = vc.declaredMethods.get("caller|()I");
+		// borrow the compiled `invokestatic id` cp index for our hand assembly
+		byte[] orig = m.code.code;
+		int at = -1;
+		for (int i = 0; i + 2 < orig.length; i++)
+			if ((orig[i] & 0xff) == 0xb8) { at = i; break; }
+		assertTrue("fixture lacks invokestatic", at > 0);
+		m.code.code = new byte[] {
+				0x10, 4,                       // bipush 4 — value id() must see
+				0x10, 60,                      // bipush 60 — junk single #1
+				0x10, 70,                      // bipush 70 — junk single #2
+				0x58,                          // pop2 — must drop BOTH junks
+				(byte) 0xb8, orig[at + 1], orig[at + 2], // invokestatic id(I)I
+				(byte) 0xac                    // ireturn
+		};
+		m.code.maxStack = 4;
+		assertEquals(4, run(vm, "P2", "caller"));
+	}
+
+	/** pop2 on a wide pair (discarded long result) — the form that already worked. */
+	@Test
+	public void pop2WidePair() throws Exception {
+		Vm vm = vm(compile(
+				"public class PW { static long big() { return 123456789012L; }"
+						+ " public static int go() { big(); return 7; } }"));
+		assertEquals(7, run(vm, "PW", "go"));
+	}
+
 	@Test
 	public void greenThreads() throws Exception {
 		Vm vm = vm(compile(

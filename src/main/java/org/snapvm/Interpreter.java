@@ -248,6 +248,47 @@ public final class Interpreter {
 		if (recv == null)
 			throw new VmException(new NullPointerException());
 		if (!(recv instanceof VmObject)) {
+			if (!owner.host) {
+				// Declared owner is a guest class, so the slot was verifier-typed
+				// Lowner; yet it holds a non-guest value — always a VM bug worth
+				// seeing raw (bridge.call would just report "host class missing").
+				StringBuilder sb = new StringBuilder();
+				for (int i = 0; i < f.locals.length; i++) {
+					Object lv = f.locals[i];
+					sb.append(' ').append(i).append('=')
+							.append(lv instanceof VmObject
+									? "VmObject:" + ((VmObject) lv).clazz.name
+									: lv == null ? "-" : lv.getClass().getName());
+				}
+				StringBuilder st = new StringBuilder();
+				for (int i = 0; i < f.sp; i++) {
+					Object sv = f.stack[i];
+					st.append(' ').append(i).append('=')
+							.append(sv instanceof VmObject
+									? "VmObject:" + ((VmObject) sv).clazz.name
+									: sv == null ? "-" : sv.getClass().getName()
+											+ "(" + sv + ")");
+				}
+				StringBuilder chain = new StringBuilder();
+				for (Frame cf : t.frames) {
+					chain.append("\n  ").append(cf.describe())
+							.append(" pc=").append(cf.pc).append(" locals:");
+					for (int i = 0; i < cf.locals.length && i < 12; i++) {
+						Object lv = cf.locals[i];
+						chain.append(' ').append(i).append('=')
+								.append(lv instanceof VmObject
+										? "VmObject:" + ((VmObject) lv).clazz.name
+										: lv == null ? "-" : lv.getClass().getName()
+												+ "(" + lv + ")");
+					}
+				}
+				System.err.println("SnapVM badrecv " + r.owner + "." + r.name + r.desc
+						+ " recv=" + recv.getClass().getName() + "(" + recv + ")"
+						+ " pc=" + pc + " sp=" + f.sp
+						+ " locals:" + sb
+						+ " stack:" + st
+						+ chain);
+			}
 			Object[] args = popToArray(f, r.desc, true);
 			Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 0);
 			f.pc = pc + oplen;
@@ -575,7 +616,7 @@ public final class Interpreter {
 			}
 			// stack ops
 			case 0x57: sp--; break;
-			case 0x58: sp--; if (st[sp] == Frame.WIDE) sp--; break; // pop2
+			case 0x58: sp -= 2; break; // pop2: wide pair or two singles = 2 slots
 			case 0x59: st[sp] = st[sp - 1]; sp++; break;             // dup
 			case 0x5a: {                                             // dup_x1
 				Object b = st[sp - 1], a = st[sp - 2];
