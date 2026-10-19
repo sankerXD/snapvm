@@ -444,6 +444,16 @@ final class HostBridge {
 				case "desiredAssertionStatus": return false;
 			}
 		}
+		// host Class receiver — J2ME games commonly use
+		// Runtime.getRuntime().getClass().getResourceAsStream() as a generic
+		// jar-resource lookup; route it through the guest class sources first
+		if (recv instanceof Class && name.equals("getResourceAsStream")) {
+			String path = (String) args[1];
+			if (!path.startsWith("/"))
+				path = "/" + packageOf(((Class<?>) recv).getName().replace('.', '/')) + path;
+			Object r = vm.getResource(path.substring(1));
+			return r != null ? r : BuiltinMarker.NOT_HANDLED;
+		}
 		return BuiltinMarker.NOT_HANDLED;
 	}
 

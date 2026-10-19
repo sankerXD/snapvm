@@ -52,7 +52,7 @@ public final class Vm {
 	}
 
 	public Vm() {
-		j2meProps.setProperty("microedition.platform", "JL-Mod-Modern");
+		j2meProps.setProperty("microedition.platform", "JL-Modern");
 		j2meProps.setProperty("microedition.encoding", "UTF-8");
 	}
 

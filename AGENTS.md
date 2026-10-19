@@ -44,3 +44,11 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
 - Written from scratch for JL-Mod-Modern (Oct 2025). SquirrelJME's SpringCoat
   was studied as an architectural reference (object-graph VM state) but no code
   was copied.
+- M3 real-game fixes (Oct 2025):
+  - `Class.getResourceAsStream` with a **host `Class` receiver** (the classic
+    `Runtime.getRuntime().getClass()` jar-resource idiom) now routes through
+    `vm.getResource` before falling back to host reflection; relative paths
+    normalize against the class's package. Test: `hostClassResourceAsStream`.
+  - Guest `System.getProperty` reads `j2meProps`; the JL-Modern adapter
+    mirrors the whole host property table (profile `SystemProperties`
+    included), matching what dex-path guests see.

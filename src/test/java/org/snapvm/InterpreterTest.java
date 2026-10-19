@@ -596,4 +596,48 @@ public class InterpreterTest {
 						+ " return xs[0].length() * 100 + xs[2].length() * 10 + n; } }"));
 		assertEquals(237, run(vm, "AA", "go"));
 	}
+
+	// J2ME games use Runtime.getRuntime().getClass().getResourceAsStream() as a
+	// generic jar-resource lookup. The receiver is a HOST Class object, so it
+	// must still reach the guest class sources — not the host classloader.
+	// Also covers relative-path normalization on a guest Class and null for
+	// missing resources. `supports.*` props ride j2meProps like midlet props do.
+	@Test
+	public void hostClassResourceAsStream() throws Exception {
+		Map<String, byte[]> classes = compile(
+				"public class Rs {"
+						+ " public static int go() throws Exception {"
+						+ "  int r = 0;"
+						+ "  java.io.InputStream a = Runtime.getRuntime().getClass()"
+						+ "   .getResourceAsStream(\"/testres.bin\");"
+						+ "  if (a == null) return -1;"
+						+ "  r = a.read();"                                 // 42
+						+ "  a.close();"
+						+ "  java.io.InputStream b = Rs.class.getResourceAsStream(\"rel.bin\");"
+						+ "  if (b == null) return -2;"
+						+ "  r += b.read() * 100;"                          // +700
+						+ "  b.close();"
+						+ "  if (Rs.class.getResourceAsStream(\"/missing.bin\") != null) return -3;"
+						+ "  if (Runtime.getRuntime().getClass()"
+						+ "   .getResourceAsStream(\"/missing.bin\") != null) return -4;"
+						+ "  if (!\"yes\".equals(System.getProperty(\"supports.mixing\"))) return -5;"
+						+ "  return r;"                                     // 742
+						+ " } }");
+		Vm vm = new Vm();
+		vm.setJ2meProperty("supports.mixing", "yes");
+		vm.addClassSource(new Vm.ClassSource() {
+			public byte[] findClass(String name) {
+				return classes.get(name.replace('/', '.'));
+			}
+
+			public InputStream findResource(String path) {
+				if (path.equals("testres.bin"))
+					return new java.io.ByteArrayInputStream(new byte[]{42});
+				if (path.equals("rel.bin"))
+					return new java.io.ByteArrayInputStream(new byte[]{7});
+				return null;
+			}
+		});
+		assertEquals(742, run(vm, "Rs", "go"));
+	}
 }
