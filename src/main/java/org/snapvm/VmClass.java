@@ -43,7 +43,7 @@ public final class VmClass {
 		this.cf = cf;
 		this.host = false;
 		this.hostClass = null;
-		this.access = cf.access;
+		this.access = cf != null ? cf.access : 0; // null cf = guest array type
 	}
 
 	VmClass(Vm vm, String name, Class<?> hostClass) {
@@ -87,6 +87,15 @@ public final class VmClass {
 			return hostClass.isAssignableFrom(other.hostClass);
 		if (name.equals("java/lang/Object"))
 			return true;
+		if (other.isArray()
+				&& (name.equals("java/lang/Cloneable") || name.equals("java/io/Serializable")))
+			return true;
+		if (isArray() && other.isArray()) {
+			VmClass tc = arrayComponent(), oc = other.arrayComponent();
+			if (tc == null || oc == null)
+				return tc == oc; // primitive components must match exactly
+			return tc.isAssignableFrom(oc);
+		}
 		if (!host && other.host) {
 			// guest interface vs host object: only if interface is host-implemented? rare; be strict
 			return false;
@@ -105,8 +114,6 @@ public final class VmClass {
 					if (i != null && isAssignableFrom(i))
 						return true;
 		}
-		if (other.isArray() && (name.equals("java/lang/Cloneable") || name.equals("java/io/Serializable")))
-			return true;
 		return false;
 	}
 
@@ -143,7 +150,18 @@ public final class VmClass {
 			if (name.equals("java/lang/Object") || name.equals("java/lang/Cloneable")
 					|| name.equals("java/io/Serializable"))
 				return true;
-			return isArray() && host == false && componentCompat(obj);
+			if (host)
+				return hostClass.isInstance(obj);
+			if (!isArray())
+				return false;
+			// guest-side array type ([Lguest/Foo; or deeper): compare components —
+			// the object's component is tracked in guestArrayTypes or, for real
+			// host arrays, its reflective component class
+			VmClass tc = arrayComponent();
+			VmClass oc = runtimeComponent(obj);
+			if (tc == null || oc == null)
+				return tc == oc;
+			return tc.isAssignableFrom(oc);
 		}
 		if (obj instanceof GuestClass)
 			return name.equals("java/lang/Class") || name.equals("java/lang/Object");
@@ -153,9 +171,34 @@ public final class VmClass {
 		return name.equals("java/lang/Object");
 	}
 
-	private boolean componentCompat(Object array) {
-		// crude: treat guest array types only at Object level
-		return name.equals("[Ljava/lang/Object;");
+	/**
+	 * The component type of an array class, or null for primitive components and
+	 * non-array classes.
+	 */
+	VmClass arrayComponent() {
+		if (!isArray())
+			return null;
+		if (host) {
+			Class<?> c = hostClass.getComponentType();
+			if (c == null || c.isPrimitive())
+				return null;
+			return vm.resolveClass(c.getName());
+		}
+		String s = name.substring(1);
+		if (s.charAt(0) == 'L')
+			s = s.substring(1, s.length() - 1);
+		return vm.resolveClass(s);
+	}
+
+	/** The runtime component type of an array OBJECT: tracked for guest arrays, reflective for host ones. */
+	private VmClass runtimeComponent(Object array) {
+		VmClass tracked = vm.guestArrayTypes.get(array);
+		if (tracked != null)
+			return tracked;
+		Class<?> comp = array.getClass().getComponentType();
+		if (comp == null || comp.isPrimitive())
+			return null;
+		return vm.resolveClass(comp.getName());
 	}
 
 	void link() {
@@ -287,6 +330,22 @@ public final class VmClass {
 	int ownStaticSlot(String name, String desc) {
 		Integer s = staticFieldSlots.get(name + "|" + desc);
 		return s == null ? -1 : s;
+	}
+
+	/** number of arguments in a method descriptor (wide counts once), excl. receiver. */
+	static int countArgs(String desc) {
+		int n = 0;
+		for (int i = 1; desc.charAt(i) != ')'; i++) {
+			char c = desc.charAt(i);
+			if (c == '[') {
+				while (desc.charAt(i) == '[') i++;
+				if (desc.charAt(i) == 'L') i = desc.indexOf(';', i);
+			} else if (c == 'L') {
+				i = desc.indexOf(';', i);
+			}
+			n++;
+		}
+		return n;
 	}
 
 	/** count of argument slots consumed by a method descriptor (excl. receiver). */

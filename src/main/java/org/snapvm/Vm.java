@@ -29,7 +29,7 @@ public final class Vm {
 	final Map<String, String> interned = new HashMap<>();
 	final IdentityHashMap<Object, Monitor> monitors = new IdentityHashMap<>();
 	final IdentityHashMap<Object, Object> proxies = new IdentityHashMap<>();   // proxy -> guest obj
-	final IdentityHashMap<Thread, Object> greenTargets = new IdentityHashMap<>();
+	final IdentityHashMap<Thread, Object> greenTargets = new IdentityHashMap<>(); // host Thread -> guest Runnable
 	final IdentityHashMap<Object, VmClass> guestArrayTypes = new IdentityHashMap<>();
 	final Properties j2meProps = new Properties();
 
@@ -40,7 +40,8 @@ public final class Vm {
 	private final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
 	private final Object lock = new Object();
 	private final Object execLock = new Object(); // serializes all guest execution
-	final IdentityHashMap<Thread, VmThread> greenThreads = new IdentityHashMap<>();
+	/** guest-visible thread key (host Thread or VmObject for guest-extends-Thread) -> green thread */
+	final IdentityHashMap<Object, VmThread> greenThreads = new IdentityHashMap<>();
 	private VmThread executor;
 	private Thread executorThread;
 
@@ -298,6 +299,7 @@ public final class Vm {
 			t.wakeTime = ms > 0 ? System.currentTimeMillis() + ms : 0;
 			t.waitMonitor = m;
 			t.waitReleasedCount = released;
+			t.resumingFromWait = true;
 			synchronized (threads) {
 				for (VmThread w : threads) {
 					if (w.state == VmThread.BLOCKED && w.waitMonitor == m) {
@@ -372,14 +374,44 @@ public final class Vm {
 		return bridge.call(t, hc.name, name, desc, a, 0);
 	}
 
+	/**
+	 * Drive the scheduler until the entry thread terminates or everything left
+	 * is permanently parked (deadlock/starvation — caller gets whatever result
+	 * exists, typically null). Timed waits stall the loop until their wake time
+	 * rather than ending the run early.
+	 */
 	private void runUntilDone(VmThread t) {
 		for (;;) {
 			pump();
 			if (!t.isAlive())
 				return;
-			if (t.state != VmThread.RUNNABLE)
+			long nap = pendingWork();
+			if (nap < 0)
 				return;
+			if (nap > 0) {
+				try {
+					Thread.sleep(Math.min(nap, 5));
+				} catch (InterruptedException ignored) {
+				}
+			}
 		}
+	}
+
+	/** @return ms until the next timed wake (0 = runnable work exists), -1 if nothing can progress. */
+	private long pendingWork() {
+		long now = System.currentTimeMillis();
+		long best = Long.MAX_VALUE;
+		synchronized (threads) {
+			for (VmThread u : threads) {
+				if (!u.isAlive() || u.frames.isEmpty())
+					continue;
+				if (u.state == VmThread.RUNNABLE)
+					return 0;
+				if (u.state == VmThread.TIMED_WAITING)
+					best = Math.min(best, Math.max(0, u.wakeTime - now));
+			}
+		}
+		return best == Long.MAX_VALUE ? -1 : best;
 	}
 
 	void pushStatic(VmThread t, VmClass c, String name, String desc, Object[] args) {
@@ -560,8 +592,20 @@ public final class Vm {
 		// an entry thread may already be TERMINATED from a previous nested run
 		if (t.state == VmThread.TERMINATED)
 			t.state = VmThread.RUNNABLE;
-		while (!c.initDone && t.isAlive())
-			Interpreter.execute(this, t, Long.MAX_VALUE);
+		while (!c.initDone && t.isAlive()) {
+			pump();
+			if (c.initDone || !t.isAlive())
+				break;
+			long nap = pendingWork();
+			if (nap < 0)
+				break; // init can't complete — let the failure surface downstream
+			if (nap > 0) {
+				try {
+					Thread.sleep(Math.min(nap, 5));
+				} catch (InterruptedException ignored) {
+				}
+			}
+		}
 	}
 
 	void greenSleep(VmThread t, long ms) {
@@ -628,30 +672,52 @@ public final class Vm {
 		}
 	}
 
-	VmThread greenOf(Thread th) {
+	VmThread greenOf(Object th) {
 		synchronized (greenThreads) {
 			return greenThreads.get(th);
 		}
 	}
 
-	void startGreen(Thread th, VmThread starter) {
-		Object target;
-		synchronized (greenTargets) {
-			target = greenTargets.get(th);
-		}
+	/**
+	 * Launch a green thread for a host Thread constructed with a guest Runnable,
+	 * or for a guest class extending Thread (key == the VmObject itself, whose
+	 * run() override is the target).
+	 */
+	void startGreen(Object key, VmThread starter) {
+		Object target = key instanceof VmObject ? key : null;
 		if (target == null) {
-			// Runnable arg that was a proxy for a guest object
-			synchronized (proxies) {
-				// find the proxy stored in the Thread — we recorded ctor args instead
+			synchronized (greenTargets) {
+				target = greenTargets.get(key);
 			}
-			throw new VmError("Thread.start without guest target");
 		}
+		if (target == null)
+			return; // Thread with no runnable target: start() is a no-op
 		VmThread nt = newThread();
-		nt.hostThread = th;
+		if (key instanceof Thread)
+			nt.hostThread = (Thread) key;
 		synchronized (greenThreads) {
-			greenThreads.put(th, nt);
+			greenThreads.put(key, nt);
 		}
 		Object recv = target;
 		pushInvoke(nt, recv, "run", "()V", new Object[]{recv});
+	}
+
+	/** A dead thread releases every monitor it still owned, waking contenders. */
+	void releaseMonitors(VmThread t) {
+		synchronized (monitors) {
+			for (Monitor m : monitors.values())
+				synchronized (m) {
+					if (m.owner == t) {
+						m.owner = null;
+						m.count = 0;
+					}
+				}
+		}
+		synchronized (threads) {
+			for (VmThread w : threads)
+				if (w.state == VmThread.BLOCKED && w.waitMonitor instanceof Monitor
+						&& ((Monitor) w.waitMonitor).owner == null)
+					w.state = VmThread.RUNNABLE; // re-contends or re-parks
+		}
 	}
 }

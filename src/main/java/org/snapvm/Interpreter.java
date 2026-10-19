@@ -41,6 +41,9 @@ public final class Interpreter {
 				step(vm, t, f);
 			} catch (VmException e) {
 				throwObject(vm, t, e.thrown);
+			} catch (RuntimeException e) {
+				// host NPE/CCE/AIOOBE from helpers: surface to guest as throwable
+				throwObject(vm, t, e);
 			}
 		}
 		return used;
@@ -49,12 +52,23 @@ public final class Interpreter {
 	/** Re-acquire a monitor for a thread resuming from wait()/contention. */
 	private static boolean reacquire(VmThread t) {
 		Object mo = t.waitMonitor;
-		Vm.Monitor m = t.vm.monitorOf(mo);
+		if (!(mo instanceof Vm.Monitor)) {
+			// clinit gate parks on the VmClass itself; nothing to reacquire
+			t.waitMonitor = null;
+			return true;
+		}
+		Vm.Monitor m = (Vm.Monitor) mo;
 		synchronized (m) {
 			if (m.owner == null || m.owner == t) {
-				m.owner = t;
-				m.count = Math.max(1, t.waitReleasedCount);
-				t.waitReleasedCount = 0;
+				if (t.resumingFromWait) {
+					// the wait() call site already advanced; grab the monitor
+					// here so resumption sees it held at the released depth
+					m.waiters.remove(t);
+					m.owner = t;
+					m.count = Math.max(1, t.waitReleasedCount);
+					t.waitReleasedCount = 0;
+					t.resumingFromWait = false;
+				}
 				t.waitMonitor = null;
 				return true;
 			}
@@ -100,13 +114,14 @@ public final class Interpreter {
 			if (handled)
 				return;
 			callerCallSite = f.fromCall;
-			t.frames.remove(t.frames.size() - 1);
-			finishClinitIfNeeded(f);
+			popFrame(t, f);
 		}
 		VmException ve = new VmException(thrown);
 		ve.vmTrace = trace;
 		t.lastError = ve;
 		t.terminate();
+		if (TRACE)
+			System.err.println("UNCAUGHT " + ve + trace);
 	}
 
 	private static void jumpToHandler(Frame f, ClassFile.ExEntry e, Object thrown) {
@@ -148,7 +163,14 @@ public final class Interpreter {
 				throw new VmException(new NoSuchMethodError(owner.name + "." + r.name + r.desc));
 			if (m.code == null)
 				throw new VmException(new AbstractMethodError(owner.name + "." + r.name));
-			pushGuestFrame(t, f, declaring(owner, m), m, r.desc, pc, oplen, false);
+			VmClass decl = declaring(owner, m);
+			Object syncOn = null;
+			if ((m.access & 0x0020) != 0) { // ACC_SYNCHRONIZED: lock the class
+				syncOn = decl.guestClass();
+				if (!vm.monEnter(t, syncOn))
+					return; // park; the whole invoke retries on wake
+			}
+			pushGuestFrame(t, f, decl, m, r.desc, pc, oplen, false, syncOn);
 			return;
 		}
 
@@ -170,8 +192,14 @@ public final class Interpreter {
 				if (r.name.equals("<init>") && recv instanceof VmObject) {
 					// host superclass constructor: manifests the adapter shadow
 					// (its own ctor runs the real host super-ctor)
-					popToArray(f, r.desc, true);
-					vm.constructShadow((VmObject) recv, owner);
+					Object[] initArgs = popToArray(f, r.desc, true);
+					VmObject g = (VmObject) recv;
+					vm.constructShadow(g, owner);
+					if (g.superCtorArgs == null)
+						g.superCtorArgs = initArgs;
+					if (g.exceptionTrace == null
+							&& Throwable.class.isAssignableFrom(owner.hostClass))
+						g.exceptionTrace = trace(t);
 					f.pc = pc + oplen;
 					return;
 				}
@@ -184,7 +212,13 @@ public final class Interpreter {
 			ClassFile.Method m = owner.findDeclared(r.name, r.desc);
 			if (m == null || m.code == null)
 				throw new VmException(new AbstractMethodError(owner.name + "." + r.name));
-			pushGuestFrame(t, f, declaring(owner, m), m, r.desc, pc, oplen, true);
+			Object syncOn = null;
+			if ((m.access & 0x0020) != 0) { // ACC_SYNCHRONIZED: lock the receiver
+				syncOn = recv;
+				if (!vm.monEnter(t, syncOn))
+					return; // park; the whole invoke retries on wake
+			}
+			pushGuestFrame(t, f, declaring(owner, m), m, r.desc, pc, oplen, true, syncOn);
 			return;
 		}
 
@@ -212,7 +246,13 @@ public final class Interpreter {
 			pushRet(f, r.desc, ret);
 			return;
 		}
-		pushGuestFrame(t, f, declaring(rc, m), m, r.desc, pc, oplen, true);
+		Object syncOn = null;
+		if ((m.access & 0x0020) != 0) { // ACC_SYNCHRONIZED: lock the receiver
+			syncOn = recv;
+			if (!vm.monEnter(t, syncOn))
+				return; // park; the whole invoke retries on wake
+		}
+		pushGuestFrame(t, f, declaring(rc, m), m, r.desc, pc, oplen, true, syncOn);
 	}
 
 	private static VmClass declaring(VmClass start, ClassFile.Method m) {
@@ -232,18 +272,28 @@ public final class Interpreter {
 	}
 
 	private static void pushGuestFrame(VmThread t, Frame caller, VmClass decl,
-			ClassFile.Method m, String desc, int pc, int oplen, boolean hasThis) {
+			ClassFile.Method m, String desc, int pc, int oplen, boolean hasThis,
+			Object syncOn) {
 		Object[] args = popToArray(caller, desc, hasThis);
 		caller.pc = pc + oplen;
 		caller.callPc = pc;
 		Frame nf = new Frame(decl, m);
 		nf.fromCall = true;
+		nf.syncOn = syncOn;
 		Vm.fillArgs(nf, desc, args, hasThis);
 		t.frames.add(nf);
 	}
 
+	/** Pop the top frame, releasing its method-level monitor if it held one. */
+	private static void popFrame(VmThread t, Frame f) {
+		t.frames.remove(t.frames.size() - 1);
+		if (f.syncOn != null)
+			t.vm.monExit(t, f.syncOn);
+		finishClinitIfNeeded(f);
+	}
+
 	private static Object[] popToArray(Frame f, String desc, boolean hasThis) {
-		int n = VmClass.argSlots(desc) + (hasThis ? 1 : 0);
+		int n = VmClass.countArgs(desc) + (hasThis ? 1 : 0);
 		Object[] a = new Object[n];
 		for (int i = n - 1; i >= 0; i--) {
 			Object v = f.stack[--f.sp];
@@ -473,7 +523,7 @@ public final class Interpreter {
 			case 0x4b: case 0x4c: case 0x4d: case 0x4e:
 				lo[op - 0x4b] = st[--sp]; break;
 			// array stores
-			case 0x4f: case 0x51: case 0x53: case 0x54: case 0x55: {
+			case 0x4f: case 0x51: case 0x54: case 0x55: case 0x56: {
 				Object v = st[--sp];
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
@@ -488,7 +538,7 @@ public final class Interpreter {
 				storeArray(arr, idx, v);
 				break;
 			}
-			case 0x56: { // aastore
+			case 0x53: { // aastore — the only store needing a covariance check
 				Object v = st[--sp];
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
@@ -766,14 +816,14 @@ public final class Interpreter {
 				f.sp = sp; return;
 			}
 			case 0xc2: { // monitorenter
-				Object o = st[--sp];
+				Object o = st[sp - 1];
 				if (o == null)
 					throw new VmException(new NullPointerException());
 				if (!vm.monEnter(t, o)) {
-					sp--; // consumed the ref; park without advancing
-					f.sp = sp;
+					f.sp = sp; // keep the ref on stack; retry instruction on wake
 					return;
 				}
+				sp--;
 				break;
 			}
 			case 0xc3: { // monitorexit
@@ -814,7 +864,7 @@ public final class Interpreter {
 				int[] sizes = new int[dims];
 				for (int i = dims - 1; i >= 0; i--)
 					sizes[i] = (Integer) st[--sp];
-				st[sp++] = multiArray(c.name, sizes, 0);
+				st[sp++] = multiArray(vm, c.name, sizes, 0);
 				f.pc = pc + 4;
 				f.sp = sp; return;
 			}
@@ -844,8 +894,7 @@ public final class Interpreter {
 
 	private static void doReturnTyped(VmThread t, Frame f) {
 		Object ret = f.stack[--f.sp];
-		finishClinitIfNeeded(f);
-		t.frames.remove(t.frames.size() - 1);
+		popFrame(t, f);
 		if (t.frames.isEmpty()) {
 			t.result = ret;
 			t.terminate();
@@ -858,8 +907,7 @@ public final class Interpreter {
 
 	private static void doReturnWide(VmThread t, Frame f) {
 		Object ret = f.stack[f.sp - 2];
-		finishClinitIfNeeded(f);
-		t.frames.remove(t.frames.size() - 1);
+		popFrame(t, f);
 		if (t.frames.isEmpty()) {
 			t.result = ret;
 			t.terminate();
@@ -873,8 +921,7 @@ public final class Interpreter {
 
 	private static void doReturnVoid(VmThread t) {
 		Frame f = t.top();
-		finishClinitIfNeeded(f);
-		t.frames.remove(t.frames.size() - 1);
+		popFrame(t, f);
 		if (t.frames.isEmpty()) {
 			t.terminate();
 			return;
@@ -895,18 +942,11 @@ public final class Interpreter {
 	private static void storeArrayChecked(Vm vm, Object arr, int idx, Object v) {
 		if (arr == null)
 			throw new VmException(new NullPointerException());
-		if (v instanceof VmObject) {
-			Class<?> ct = arr.getClass().getComponentType();
-			if (ct != null && ct != Object.class)
-				throw new VmException(new ArrayStoreException("guest obj into " + ct));
-			VmClass comp = vm.guestArrayTypes.get(arr);
-			if (comp != null && !comp.isInstance(v))
-				throw new VmException(new ArrayStoreException());
-		}
-		if (v == null) {
-			Array.set(arr, idx, null);
-			return;
-		}
+		// guest-side arrays are Object[] under the hood — their real component
+		// type lives in guestArrayTypes; enforce covariance ourselves
+		VmClass comp = vm.guestArrayTypes.get(arr);
+		if (comp != null && v != null && !comp.isInstance(v))
+			throw new VmException(new ArrayStoreException());
 		try {
 			Array.set(arr, idx, v);
 		} catch (IllegalArgumentException e) {
@@ -936,30 +976,51 @@ public final class Interpreter {
 		return a;
 	}
 
-	private static Object multiArray(String desc, int[] sizes, int d) {
-		// desc like "[[I" — component for this level
+	/**
+	 * Allocate a multi-dim array with real runtime types where possible:
+	 * int[][] is a real int[][], String[][] a real String[][]. Only levels
+	 * whose component is a guest class degrade to Object[], tracked in
+	 * guestArrayTypes so checkcast/aastore keep JVM semantics.
+	 */
+	private static Object multiArray(Vm vm, String desc, int[] sizes, int d) {
 		int n = sizes[d];
-		if (d == sizes.length - 1) {
-			String elem = desc.substring(d);
-			switch (elem.charAt(0)) {
-				case 'I': return new int[n];
-				case 'J': return new long[n];
-				case 'F': return new float[n];
-				case 'D': return new double[n];
-				case 'B': return new byte[n];
-				case 'C': return new char[n];
-				case 'S': return new short[n];
-				case 'Z': return new boolean[n];
-				default:
-					Object[] a = new Object[n];
-					for (int i = 0; i < n; i++) a[i] = null;
-					return a;
-			}
+		String comp = desc.substring(d + 1); // component descriptor at this level
+		boolean leaf = d == sizes.length - 1;
+		VmClass cc = null;
+		if (comp.charAt(0) == 'L')
+			cc = vm.resolveClass(comp.substring(1, comp.length() - 1));
+		else if (comp.charAt(0) == '[')
+			cc = vm.resolveClass(comp);
+		Object a;
+		if (leaf && cc == null) {
+			a = newPrimArray(comp.charAt(0), n);
+		} else if (cc != null && cc.host) {
+			a = Array.newInstance(cc.hostClass, n);
+		} else {
+			a = new Object[n];
+			if (cc != null)
+				vm.guestArrayTypes.put(a, cc);
 		}
-		Object[] a = new Object[n];
-		for (int i = 0; i < n; i++)
-			a[i] = multiArray(desc, sizes, d + 1);
+		if (!leaf) {
+			Object[] oa = (Object[]) a;
+			for (int i = 0; i < n; i++)
+				oa[i] = multiArray(vm, desc, sizes, d + 1);
+		}
 		return a;
+	}
+
+	private static Object newPrimArray(char c, int n) {
+		switch (c) {
+			case 'I': return new int[n];
+			case 'J': return new long[n];
+			case 'F': return new float[n];
+			case 'D': return new double[n];
+			case 'B': return new byte[n];
+			case 'C': return new char[n];
+			case 'S': return new short[n];
+			case 'Z': return new boolean[n];
+			default: throw new VmError("bad element type " + c);
+		}
 	}
 
 	private static void insWide(Object[] st, int sp) {

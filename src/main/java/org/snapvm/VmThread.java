@@ -36,6 +36,7 @@ public final class VmThread {
 
 	void terminate() {
 		state = TERMINATED;
+		vm.releaseMonitors(this);
 		synchronized (joinWaiters) {
 			for (VmThread t : joinWaiters)
 				vm.wake(t);

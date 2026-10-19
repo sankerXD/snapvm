@@ -10,6 +10,11 @@ public final class VmObject {
 	 * object is marshaled to a host API expecting the real class.
 	 */
 	public Object hostShadow;
+	/** Args passed to the first host-super <init> (recv at [0]); kept so host-side
+	 * state that skipped construction (e.g. Throwable's message) stays recoverable. */
+	Object[] superCtorArgs;
+	Object exceptionCause;                 // set by Throwable.initCause
+	String exceptionTrace;                 // guest stack captured at construction (printStackTrace)
 
 	VmObject(VmClass clazz) {
 		this.clazz = clazz;

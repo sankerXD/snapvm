@@ -12,6 +12,7 @@ final class Frame {
 	int sp;              // next free stack slot
 	int callPc = -1;     // pc of the invoke instruction that pushed our callee, if any
 	boolean fromCall;    // this frame was pushed by an invoke* (not clinit/entry)
+	Object syncOn;       // monitor acquired for an ACC_SYNCHRONIZED method, or null
 
 	Frame(VmClass owner, ClassFile.Method m) {
 		this.owner = owner;

@@ -201,13 +201,25 @@ final class HostBridge {
 		// VM-provided semantics first
 		Object r = builtin(t, ownerName, name, desc, args, kind);
 		if (r != BuiltinMarker.NOT_HANDLED)
-			return r;
+			return Vm.fromHost(r);
 
 		Class<?> hc;
 		try {
 			hc = Class.forName(ownerName.replace('/', '.'));
 		} catch (ClassNotFoundException e) {
 			throw new VmError("host class missing " + ownerName);
+		}
+		// guest receiver on a non-Object boundary: Throwable and Object.*
+		// semantics are still VM-provided, not reflective
+		if (kind == 0 && args.length > 0 && args[0] instanceof VmObject) {
+			if (Throwable.class.isAssignableFrom(hc)) {
+				Object tr = throwableBuiltin(t, (VmObject) args[0], name, args);
+				if (tr != BuiltinMarker.NOT_HANDLED)
+					return Vm.fromHost(tr);
+			}
+			Object or = objectBuiltin(t, name, desc, args);
+			if (or != BuiltinMarker.NOT_HANDLED)
+				return Vm.fromHost(or);
 		}
 		try {
 			if (kind == 3) {
@@ -238,7 +250,9 @@ final class HostBridge {
 	private Object builtin(VmThread t, String owner, String name, String desc, Object[] args, int kind) {
 		switch (owner) {
 			case "java/lang/Object":
-				return objectBuiltin(t, name, desc, args);
+				// kind 3 is `new Object()` construction — no builtin, reflect it
+				return kind == 3 ? BuiltinMarker.NOT_HANDLED
+						: objectBuiltin(t, name, desc, args);
 			case "java/lang/Class":
 				return classBuiltin(t, name, desc, args, kind);
 			case "java/lang/Thread":
@@ -301,6 +315,71 @@ final class HostBridge {
 			default:
 				return BuiltinMarker.NOT_HANDLED;
 		}
+	}
+
+	/**
+	 * java.lang.Throwable methods on guest exceptions. The host-super <init>
+	 * never ran reflectively (no shadow), so message/cause live in
+	 * {@link VmObject#superCtorArgs}; the guest stack was captured at
+	 * construction into {@link VmObject#exceptionTrace}.
+	 */
+	private Object throwableBuiltin(VmThread t, VmObject g, String name, Object[] args) {
+		switch (name) {
+			case "getMessage":
+			case "getLocalizedMessage":
+				return throwableMessage(g);
+			case "getCause":
+				return g.exceptionCause != null ? g.exceptionCause : ctorCause(g);
+			case "initCause":
+				if (ctorCause(g) != null)
+					throw new VmException(
+							new IllegalStateException("cause already initialized"));
+				g.exceptionCause = args[1];
+				return g;
+			case "toString": {
+				String msg = throwableMessage(g);
+				return g.clazz.binaryName() + (msg != null ? ": " + msg : "");
+			}
+			case "printStackTrace": {
+				String msg = throwableMessage(g);
+				String text = g.clazz.binaryName() + (msg != null ? ": " + msg : "")
+						+ (g.exceptionTrace != null ? g.exceptionTrace : "");
+				if (args.length > 1 && args[1] != null) {
+					try {
+						args[1].getClass().getMethod("println", String.class)
+								.invoke(args[1], text);
+					} catch (Exception e) {
+						System.err.println(text);
+					}
+				} else {
+					System.err.println(text);
+				}
+				return null;
+			}
+			case "fillInStackTrace":
+				g.exceptionTrace = Interpreter.trace(t);
+				return g;
+			default:
+				return BuiltinMarker.NOT_HANDLED;
+		}
+	}
+
+	private static String throwableMessage(VmObject g) {
+		Object[] a = g.superCtorArgs;
+		if (a != null)
+			for (int i = 1; i < a.length; i++)
+				if (a[i] instanceof String)
+					return (String) a[i];
+		return null;
+	}
+
+	private static Object ctorCause(VmObject g) {
+		Object[] a = g.superCtorArgs;
+		if (a != null)
+			for (int i = 1; i < a.length; i++)
+				if (a[i] instanceof Throwable || a[i] instanceof VmObject)
+					return a[i];
+		return null;
 	}
 
 	private Object classOf(Object recv) {
@@ -403,13 +482,12 @@ final class HostBridge {
 			}
 		}
 		Object recv = args[0];
-		Thread th = recv instanceof Thread ? (Thread) recv : null;
 		switch (name) {
 			case "start":
-				vm.startGreen(th, t);
+				vm.startGreen(recv, t);
 				return null;
 			case "join": {
-				VmThread target = vm.greenOf(th);
+				VmThread target = vm.greenOf(recv);
 				if (target != null && target.isAlive()) {
 					target.addJoinWaiter(t);
 					vm.park(t, desc.equals("(J)V") ? (Long) args[1] : 0);
@@ -417,7 +495,7 @@ final class HostBridge {
 				return null;
 			}
 			case "isAlive": {
-				VmThread target = vm.greenOf(th);
+				VmThread target = vm.greenOf(recv);
 				return target != null && target.isAlive();
 			}
 			case "interrupt":
