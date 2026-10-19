@@ -557,4 +557,43 @@ public class InterpreterTest {
 						+ " return (A == \"lit\") ? 1 : 0; } }"));
 		assertEquals(1, run(vm, "Si", "go"));
 	}
+
+	// Sup has a <clinit>, Sub has none. Constructing Sub must run Sup's
+	// <clinit> under Sup's own constant pool — not borrowed onto Sub.
+	@Test
+	public void superClinitOwnConstantPool() throws Exception {
+		Vm vm = vm(compile(
+				"public class Sup { public static int s; static { s = 41; } public int v = 1; }",
+				"public class Sub extends Sup { public int w = 2; }",
+				"public class Sc { public static int go() {"
+						+ " return new Sub().w + Sup.s + new Sub().v; } }"));
+		assertEquals(44, run(vm, "Sc", "go"));
+	}
+
+	// bastore/castore/sastore take an int on the operand stack and truncate it;
+	// java.lang.reflect.Array.set refuses Integer for byte/char/short/boolean
+	// arrays, so the interpreter must narrow explicitly.
+	@Test
+	public void primitiveArrayNarrowingStores() throws Exception {
+		Vm vm = vm(compile(
+				"public class PA { public static int go() {"
+						+ " byte[] b = new byte[2]; b[0] = 22; b[1] = -1;"
+						+ " short[] s = new short[1]; s[0] = 300;"
+						+ " char[] c = new char[1]; c[0] = 65;"
+						+ " boolean[] z = new boolean[2]; z[0] = true;"
+						+ " return b[0] * 10000 + b[1] + s[0] * 10 + c[0]"
+						+ " + (z[0] ? 1 : 0); } }"));
+		assertEquals(220000 - 1 + 3000 + 65 + 1, run(vm, "PA", "go"));
+	}
+
+	@Test
+	public void objectArrayArgDescriptor() throws Exception {
+		Vm vm = vm(compile(
+				"public class AA { public static int go() {"
+						+ " String[] xs = {\"ab\", \"c\", \"def\"};"
+						+ " return take(xs, 7); }"
+						+ " static int take(String[] xs, int n) {"
+						+ " return xs[0].length() * 100 + xs[2].length() * 10 + n; } }"));
+		assertEquals(237, run(vm, "AA", "go"));
+	}
 }

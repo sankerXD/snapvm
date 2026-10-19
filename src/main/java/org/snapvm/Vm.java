@@ -61,6 +61,12 @@ public final class Vm {
 		sources.add(src);
 	}
 
+	/** Value returned to guest code for {@code System.getProperty(key)}. */
+	public void setJ2meProperty(String key, String value) {
+		if (value != null)
+			j2meProps.setProperty(key, value);
+	}
+
 	public void addJar(ZipFile jar) {
 		addClassSource(new ClassSource() {
 			public byte[] findClass(String name) {
@@ -193,6 +199,35 @@ public final class Vm {
 
 	void wake(VmThread t) {
 		t.state = VmThread.RUNNABLE;
+	}
+
+	/** Debug dump: state + top frames of every live green thread. */
+	public String dumpThreads() {
+		StringBuilder sb = new StringBuilder();
+		synchronized (threads) {
+			for (VmThread t : threads) {
+				if (!t.isAlive())
+					continue;
+				sb.append("state=").append(t.state)
+						.append(t.waitMonitor != null ? " waitMon" : "")
+						.append(" frames=").append(t.frames.size()).append('\n');
+				for (int i = t.frames.size() - 1; i >= 0 && i > t.frames.size() - 4; i--) {
+					Frame f = t.frames.get(i);
+					sb.append("  at ").append(f.owner.name).append('.')
+							.append(f.method.name).append(f.method.desc)
+							.append(" @").append(f.pc).append('\n');
+				}
+			}
+		}
+		return sb.toString();
+	}
+
+	/** Debug: flattened view of a guest object's instance fields (name|desc -> value). */
+	public Map<String, Object> fieldValues(VmObject obj) {
+		Map<String, Object> out = new java.util.LinkedHashMap<>();
+		for (Map.Entry<String, Integer> e : obj.clazz.fieldSlots.entrySet())
+			out.put(e.getKey(), obj.fields[e.getValue()]);
+		return out;
 	}
 
 	public void pump() {
@@ -375,26 +410,53 @@ public final class Vm {
 	}
 
 	/**
-	 * Drive the scheduler until the entry thread terminates or everything left
-	 * is permanently parked (deadlock/starvation — caller gets whatever result
-	 * exists, typically null). Timed waits stall the loop until their wake time
-	 * rather than ending the run early.
+	 * Drive the entry thread to completion, interleaving other green threads
+	 * while it is parked. execLock is only held per slice — never across the
+	 * park wait — so a blocking host call (e.g. parked serviceRepaints waiting
+	 * on an event-queue marker) cannot deadlock against another host executor
+	 * that needs the lock to produce the wakeup.
 	 */
 	private void runUntilDone(VmThread t) {
+		Thread prev = executorThread;
 		for (;;) {
-			pump();
-			if (!t.isAlive())
-				return;
-			long nap = pendingWork();
-			if (nap < 0)
-				return;
-			if (nap > 0) {
+			synchronized (execLock) {
+				executorThread = Thread.currentThread();
 				try {
-					Thread.sleep(Math.min(nap, 5));
-				} catch (InterruptedException ignored) {
+					if (canRun(t)) {
+						executor = t;
+						Interpreter.execute(this, t, Long.MAX_VALUE);
+						executor = null;
+					}
+					if (!t.isAlive())
+						return;
+					if (canRun(t))
+						continue;
+					// t parked: let other green threads try to unblock it
+					pump();
+					if (!t.isAlive() || canRun(t))
+						continue;
+					if (pendingWork() < 0)
+						return;
+				} finally {
+					executor = null;
+					executorThread = prev;
 				}
 			}
+			// parked with work pending elsewhere — release the lock and yield
+			try {
+				Thread.sleep(1);
+			} catch (InterruptedException ignored) {
+			}
 		}
+	}
+
+	private static boolean canRun(VmThread t) {
+		if (t.frames.isEmpty())
+			return false;
+		if (t.state == VmThread.RUNNABLE)
+			return true;
+		return t.state == VmThread.TIMED_WAITING
+				&& System.currentTimeMillis() >= t.wakeTime;
 	}
 
 	/** @return ms until the next timed wake (0 = runnable work exists), -1 if nothing can progress. */
@@ -440,7 +502,10 @@ public final class Vm {
 		VmClass owner;
 		if (recv instanceof VmObject) {
 			owner = ((VmObject) recv).clazz;
-			m = owner.findMethod(name, desc);
+			// <init> is not inherited; merged methodMap would find a parent's
+			m = name.equals("<init>")
+					? owner.declaredMethods.get(name + "|" + desc)
+					: owner.findMethod(name, desc);
 			if (m == null) {
 				VmClass hb = owner.hostBoundary();
 				Object r = bridge.call(t, hb != null ? hb.name : "java/lang/Object",
@@ -479,9 +544,11 @@ public final class Vm {
 			f.locals[li++] = args[ai++];
 		for (int i = 1; desc.charAt(i) != ')'; i++) {
 			char c = desc.charAt(i);
-			if (c == '[')
+			if (c == '[') {
 				while (desc.charAt(i) == '[')
 					i++;
+				c = desc.charAt(i);
+			}
 			if (c == 'L')
 				i = desc.indexOf(';', i);
 			Object v = args[ai++];
@@ -509,15 +576,15 @@ public final class Vm {
 			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
 			return cur.nestedResult;
 		}
+		VmThread t = newThread();
+		t.hostThread = Thread.currentThread();
 		synchronized (execLock) {
-			VmThread t = newThread();
-			t.hostThread = Thread.currentThread();
 			pushInvoke(t, recv, name, desc, joinArgs(recv, args));
-			runUntilDone(t);
-			if (t.lastError != null)
-				throw t.lastError;
-			return t.result;
 		}
+		runUntilDone(t);
+		if (t.lastError != null)
+			throw t.lastError;
+		return t.result;
 	}
 
 	private static Object[] joinArgs(Object recv, Object[] args) {
@@ -550,7 +617,9 @@ public final class Vm {
 				x.initRunning = true;
 				x.initThread = t;
 			}
-			ClassFile.Method clinit = x.findDeclared("<clinit>", "()V");
+			// only x's OWN <clinit> — findDeclared walks supers and would return
+			// a parent's, whose bytecode indexes a different constant pool
+			ClassFile.Method clinit = x.declaredMethods.get("<clinit>|()V");
 			if (clinit == null) {
 				finishInit(x);
 				continue;
@@ -700,6 +769,90 @@ public final class Vm {
 		}
 		Object recv = target;
 		pushInvoke(nt, recv, "run", "()V", new Object[]{recv});
+	}
+
+	// ---------- parked host calls ----------
+
+	/**
+	 * A host-call intercept that parks the calling green thread instead of
+	 * blocking a real host thread (e.g. Canvas.serviceRepaints). The handler
+	 * performs the host-side action and invokes {@code done} when the guest
+	 * call may resume; {@code done} may run on any thread, including
+	 * synchronously before {@code invoke} returns.
+	 */
+	public interface ParkedCall {
+		void invoke(Vm vm, VmThread t, Object[] args, Runnable done);
+	}
+
+	private final Map<String, ParkedCall> parkedCalls = new HashMap<>();
+	private static final Object PARKED = new Object();
+
+	/** key format: "javax/microedition/lcdui/Canvas.serviceRepaints()V" */
+	public void registerParkedCall(String methodKey, ParkedCall call) {
+		parkedCalls.put(methodKey, call);
+	}
+
+	ParkedCall parkedCall(String ownerName, String name, String desc) {
+		String suffix = "." + name + desc;
+		ParkedCall pc = parkedCalls.get(ownerName + suffix);
+		if (pc != null)
+			return pc;
+		// the call site names a guest class's host boundary (e.g. FullCanvas),
+		// not the registering class — walk the host hierarchy
+		try {
+			for (Class<?> h = Class.forName(ownerName.replace('/', '.'));
+					h != null; h = h.getSuperclass()) {
+				pc = parkedCalls.get(h.getName().replace('.', '/') + suffix);
+				if (pc != null)
+					return pc;
+				for (Class<?> i : h.getInterfaces()) {
+					pc = parkedCalls.get(i.getName().replace('.', '/') + suffix);
+					if (pc != null)
+						return pc;
+				}
+			}
+		} catch (ClassNotFoundException ignored) {
+		}
+		return null;
+	}
+
+	/** Run a parked call: the green thread sleeps until the handler's done. */
+	Object callParked(VmThread t, ParkedCall pc, Object[] args) {
+		t.state = VmThread.WAITING;
+		t.waitMonitor = PARKED;
+		final boolean[] resumed = {false};
+		Runnable done = () -> {
+			synchronized (threads) {
+				if (resumed[0])
+					return;
+				resumed[0] = true;
+				t.waitMonitor = null;
+				if (t.state == VmThread.WAITING)
+					t.state = VmThread.RUNNABLE;
+			}
+		};
+		try {
+			pc.invoke(this, t, args, done);
+		} catch (RuntimeException e) {
+			done.run();
+			throw e;
+		}
+		return null;
+	}
+
+	/** Whether the method is declared in guest code below the host boundary —
+	 *  shadows use this to forward only callbacks the guest actually overrode. */
+	public boolean guestDeclares(VmObject obj, String name, String desc) {
+		String key = name + "|" + desc;
+		for (VmClass c = obj.clazz; c != null && !c.host; c = c.superClass)
+			if (c.declaredMethods.containsKey(key))
+				return true;
+		return false;
+	}
+
+	/** Marshal a guest value to a host-typed one (shadow/proxy/raw). */
+	public Object toHost(Object v, Class<?> target) {
+		return bridge.toHost(v, target);
 	}
 
 	/** A dead thread releases every monitor it still owned, waking contenders. */

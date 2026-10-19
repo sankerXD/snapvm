@@ -81,6 +81,17 @@ public final class Interpreter {
 
 	static void throwObject(Vm vm, VmThread t, Object thrown) {
 		String trace = trace(t); // capture before frames are popped
+		if (TRACE_THROWS && !t.frames.isEmpty()) {
+			Frame top = t.top();
+			String key = thrown + "@" + top.owner.name + "." + top.method.name
+					+ "@" + top.pc;
+			if (TRACE_SEEN.add("T" + key)) {
+				System.err.println("GuestThrow " + thrown + " at "
+						+ top.owner.name + "." + top.method.name + "@" + top.pc);
+				if (thrown instanceof Throwable)
+					((Throwable) thrown).printStackTrace();
+			}
+		}
 		boolean callerCallSite = false;
 		while (!t.frames.isEmpty()) {
 			Frame f = t.top();
@@ -120,8 +131,9 @@ public final class Interpreter {
 		ve.vmTrace = trace;
 		t.lastError = ve;
 		t.terminate();
-		if (TRACE)
-			System.err.println("UNCAUGHT " + ve + trace);
+		// uncaught guest exceptions dump the guest trace — this is the only
+		// stack a host-side crash report will ever see
+		System.err.println("SnapVM uncaught " + ve + trace);
 	}
 
 	private static void jumpToHandler(Frame f, ClassFile.ExEntry e, Object thrown) {
@@ -147,6 +159,12 @@ public final class Interpreter {
 	// kind: 0 virtual/interface, 1 static, 2 special
 	private static void invoke(Vm vm, VmThread t, Frame f, ClassFile.Ref r, int pc, int oplen,
 			int kind) {
+		if (TRACE_CALLS != null
+				&& (r.owner + "." + r.name + r.desc).matches(TRACE_CALLS)
+				&& TRACE_SEEN.add("C" + r.owner + "." + r.name + r.desc
+						+ "<-" + f.owner.name + "." + f.method.name + "@" + pc))
+			System.err.println("GuestCall " + r.owner + "." + r.name + r.desc
+					+ " from " + f.owner.name + "." + f.method.name + "@" + pc);
 		VmClass owner = vm.resolveClass(r.owner);
 		if (kind == 1) {
 			if (owner.host) {
@@ -209,7 +227,11 @@ public final class Interpreter {
 				pushRet(f, r.desc, ret);
 				return;
 			}
-			ClassFile.Method m = owner.findDeclared(r.name, r.desc);
+			// <init> is not inherited — supers walk would run a parent's ctor
+			// under this class's constant pool; plain invokespecial does walk
+			ClassFile.Method m = r.name.equals("<init>")
+					? owner.declaredMethods.get(r.name + "|" + r.desc)
+					: owner.findDeclared(r.name, r.desc);
 			if (m == null || m.code == null)
 				throw new VmException(new AbstractMethodError(owner.name + "." + r.name));
 			Object syncOn = null;
@@ -428,6 +450,10 @@ public final class Interpreter {
 	// ---------- the step ----------
 
 	public static volatile boolean TRACE = false;
+	public static volatile boolean TRACE_THROWS = false;
+	public static volatile String TRACE_CALLS = null;
+	private static final java.util.Set<String> TRACE_SEEN =
+			java.util.concurrent.ConcurrentHashMap.newKeySet();
 
 	private static void step(Vm vm, VmThread t, Frame f) {
 		byte[] code = f.method.code.code;
@@ -482,7 +508,9 @@ public final class Interpreter {
 			case 0x2e: case 0x30: case 0x32: case 0x33: case 0x34: case 0x35: {
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				st[sp++] = Array.get(arr, idx);
+				// baload/caload/saload unwrap to Byte/Character/Short/Boolean;
+				// the guest stack convention is Integer
+				st[sp++] = Vm.fromHost(Array.get(arr, idx));
 				break;
 			}
 			case 0x2f: case 0x31: {
@@ -932,6 +960,27 @@ public final class Interpreter {
 	private static void storeArray(Object arr, int idx, Object v) {
 		if (arr == null)
 			throw new VmException(new NullPointerException());
+		// Guest Z/B/S/C values are Integer on the operand stack; JVM xstore
+		// truncates them, but Array.set only unwraps exact/widening types.
+		if (v instanceof Integer) {
+			int iv = (Integer) v;
+			if (arr instanceof byte[]) {
+				((byte[]) arr)[idx] = (byte) iv;
+				return;
+			}
+			if (arr instanceof boolean[]) {
+				((boolean[]) arr)[idx] = (iv & 1) != 0;
+				return;
+			}
+			if (arr instanceof char[]) {
+				((char[]) arr)[idx] = (char) iv;
+				return;
+			}
+			if (arr instanceof short[]) {
+				((short[]) arr)[idx] = (short) iv;
+				return;
+			}
+		}
 		try {
 			Array.set(arr, idx, v);
 		} catch (IllegalArgumentException e) {

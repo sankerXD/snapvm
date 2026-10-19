@@ -202,6 +202,10 @@ final class HostBridge {
 		Object r = builtin(t, ownerName, name, desc, args, kind);
 		if (r != BuiltinMarker.NOT_HANDLED)
 			return Vm.fromHost(r);
+		// adapter-registered blocking calls park the green thread until done
+		Vm.ParkedCall pc = vm.parkedCall(ownerName, name, desc);
+		if (pc != null)
+			return vm.callParked(t, pc, args);
 
 		Class<?> hc;
 		try {

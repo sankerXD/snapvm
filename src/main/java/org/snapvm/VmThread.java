@@ -34,6 +34,11 @@ public final class VmThread {
 		return frames.isEmpty() ? null : frames.get(frames.size() - 1);
 	}
 
+	/** host thread this green thread's entry call was made on (for parked calls). */
+	public Thread hostThread() {
+		return hostThread;
+	}
+
 	void terminate() {
 		state = TERMINATED;
 		vm.releaseMonitors(this);
