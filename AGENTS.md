@@ -317,5 +317,12 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     waitNotify still green.
   - Diagnostic that cracked it: a 9ms-cadence `Thread.getAllStackTraces`
     sampler filtering stacks containing org.snapvm frames, leaf-frame
-    histogram — ~50 LoC, gated by a marker file, removed after use.
-    Cheap and decisive for "where does interpreter wall-time go".
+    histogram. Now a permanent tool: **`VmSampler`** (`org.snapvm`) —
+    `new VmSampler(vm, sink).start()` dumps a category rollup
+    (interp/monitor/host-call/native-io/sched/idle %) + top leaf stacks
+    per window, and appends the running GUEST frame (`| guest X.m@pc`)
+    when a sampled thread is the executor (`vm.executor`/`executorThread`
+    are package-visible for this). Skips its own thread — self-sampling
+    of `getAllStackTraces` otherwise dominates the histogram. Cheap and
+    decisive for "where does interpreter wall-time go"; JL-Modern wires
+    it to the `snapvm.sample` marker. Test: `samplesAttributeGuestFrames`.

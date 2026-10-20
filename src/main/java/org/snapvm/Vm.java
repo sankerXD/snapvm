@@ -50,8 +50,9 @@ public final class Vm {
 	private final Object execLock = new Object(); // serializes all guest execution
 	/** guest-visible thread key (host Thread or VmObject for guest-extends-Thread) -> green thread */
 	final IdentityHashMap<Object, VmThread> greenThreads = new IdentityHashMap<>();
-	private VmThread executor;
-	private Thread executorThread;
+	// package-visible for VmSampler's guest-frame attribution
+	VmThread executor;
+	Thread executorThread;
 
 	static final class Monitor {
 		VmThread owner;
