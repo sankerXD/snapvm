@@ -227,6 +227,42 @@ public class SnapshotTest {
 		assertEquals(7, run(vm, "Pc", "fin"));
 	}
 
+	// Reference arrays must revive with their real runtime type, not a bare
+	// Object[] — DNF kept int[][] tables inside a Vector and every post-
+	// restore checkcast [[I died (invisible character). Guest-component
+	// arrays still resolve through guestArrayTypes.
+	@Test
+	public void typedArraysKeepRuntimeType() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Ta {"
+						+ " static java.util.Vector v; static String[] ss;"
+						+ " static int[][] grid; static Ta[] ta;"
+						+ " public static int go() {"
+						+ "  v = new java.util.Vector();"
+						+ "  v.addElement(new int[][]{{1, 2}, {3}});"
+						+ "  ss = new String[]{\"a\", \"b\"};"
+						+ "  grid = new int[2][];"
+						+ "  grid[0] = new int[]{9}; grid[1] = new int[]{8, 7};"
+						+ "  ta = new Ta[2]; ta[0] = new Ta();"
+						+ "  return 0; }"
+						+ " public static int check() {"
+						+ "  int[][] a = (int[][]) v.elementAt(0);"   // checkcast [[I
+						+ "  Object o = ss; String[] s = (String[]) o;" // checkcast [Ljava/lang/String;
+						+ "  int[][] g = (int[][]) grid;"
+						+ "  Ta[] t = (Ta[]) ta;"                      // guest-component array
+						+ "  return a[1][0] + s.length + g[1][1] + t.length; } }");
+		Vm vm = vm(cls);
+		run(vm, "Ta", "go");
+		assertEquals(14, run(vm, "Ta", "check")); // pre-restore sanity
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		assertEquals(14, run(vm, "Ta", "check"));
+
+		Vm fresh = vm(cls);
+		fresh.restore(snap);
+		assertEquals(14, run(fresh, "Ta", "check"));
+	}
+
 	// Host objects with no registered codec must abort the save loudly —
 	// a half-written world is worse than a refused one.
 	@Test

@@ -68,7 +68,10 @@ via (String) or () ctor), `PROXY`(value guestObj — a host interface proxy in
 guest state unwraps to its guest), `POBJ`(— — plain `java.lang.Object`, a
 pure identity token restored as `new Object()`),
 `ARR_B/S/C/I/Z/J/F/D`(i32 len + raw elements), `ARR_OBJ`(i32 len + values —
-guest component type lives in the `arrays` section).
+legacy; revived as bare `Object[]`), `ARR_TYPED`(str componentClassName +
+i32 len + values — revived via `Array.newInstance` so `int[][]`/`String[]`
+keep their runtime type; guest component type lives in the `arrays`
+section). New writes always emit `ARR_TYPED`.
 
 Boxed scalars serialize by value — their `==` identity across a save is not
 preserved (irrelevant: J2ME code cannot observe it — `if_acmp` on boxeds is

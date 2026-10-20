@@ -229,9 +229,21 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     host-shadow state back on restore; a live hostShadow without a codec
     refuses the save — silent corruption is worse than a loud refusal.
     JL-Modern adapter codecs are the M5b half.
-  - Tests `SnapshotTest` ×7: round-trip worker (same-vm + fresh-vm),
+  - Tests `SnapshotTest` ×8: round-trip worker (same-vm + fresh-vm),
     heap identity/cycles/intern, wait-restore, sleep-delta, parked
-    replay, unhandled-host refusal, built-in handles.
+    replay, typed-array runtime types, unhandled-host refusal,
+    built-in handles.
+  - **DNF invisible character (Oct 2025)** — `ARR_OBJ` dropped the
+    component type: every reference array revived as bare `Object[]`,
+    so a guest `checkcast [[I` on a restored `int[][]` table died with
+    ClassCastException each frame (game caught it per layer index →
+    "Error on PaintMap(): 0" spam + nothing drawn). New `ARR_TYPED`
+    records store `component.getName()` and revive via
+    `Array.newInstance(cc.hostClass)`; `ARR_OBJ` kept for reading old
+    snaps. Test: `typedArraysKeepRuntimeType` (int[][] inside Vector +
+    String[] + guest-component Ta[]). Lesson: **runtime array class is
+    guest-observable via checkcast — "reference array" is not one
+    bucket**. Old-format snaps still produce Object[] — re-save.
 - M5b adapter integration (Oct 2025, JL-Modern `6149790d`) — codecs +
   shell wiring live in the app repo (`org.snapvm.adapter.SnapHandles`
   for host objects: Image/Font/Graphics/Player/RecordStore/Command/

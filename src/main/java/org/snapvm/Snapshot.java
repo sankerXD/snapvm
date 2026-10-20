@@ -29,7 +29,8 @@ final class Snapshot {
 	private static final int K_STR = 0, K_OBJ = 1, K_THREAD_BOX = 2,
 			K_HANDLE = 3, K_THROWABLE = 4, K_PROXY = 5, K_POBJ = 6,
 			K_ARR_B = 10, K_ARR_S = 11, K_ARR_C = 12, K_ARR_I = 13, K_ARR_Z = 14,
-			K_ARR_J = 15, K_ARR_F = 16, K_ARR_D = 17, K_ARR_OBJ = 18;
+			K_ARR_J = 15, K_ARR_F = 16, K_ARR_D = 17, K_ARR_OBJ = 18,
+			K_ARR_TYPED = 19;
 	// waitMonitor encodings
 	private static final int W_NONE = 0, W_MONITOR = 1, W_PARKED = 2, W_CLINIT = 3;
 
@@ -450,7 +451,11 @@ final class Snapshot {
 				for (double x : (double[]) arr)
 					out.writeDouble(x);
 			} else {
-				out.writeByte(K_ARR_OBJ);
+				// TYPED carries the runtime component class name so restore
+				// rebuilds e.g. a real int[][] instead of a bare Object[] —
+				// guest checkcast [[I would fail on a revived Object[].
+				out.writeByte(K_ARR_TYPED);
+				str(comp.getName());
 				out.writeInt(n);
 				for (Object x : (Object[]) arr)
 					value(x);
@@ -792,6 +797,7 @@ final class Snapshot {
 			case K_ARR_F:
 			case K_ARR_D:
 			case K_ARR_OBJ:
+			case K_ARR_TYPED:
 				return readArray(kind, id);
 			default:
 				throw new VmError("bad object kind");
@@ -830,6 +836,9 @@ final class Snapshot {
 		}
 
 		Object readArray(int kind, int id) throws IOException {
+			VmClass cc = null;
+			if (kind == K_ARR_TYPED)
+				cc = vm.resolveClass(str());
 			int n = in.readInt();
 			Object a;
 			switch (kind) {
@@ -857,8 +866,17 @@ final class Snapshot {
 			case K_ARR_D:
 				a = new double[n];
 				break;
-			default: // K_ARR_OBJ
+			case K_ARR_OBJ:
 				a = new Object[n];
+				break;
+			default: // K_ARR_TYPED — real runtime component type
+				if (cc != null && cc.host) {
+					a = Array.newInstance(cc.hostClass, n);
+				} else {
+					a = new Object[n];
+					if (cc != null)
+						vm.guestArrayTypes.put(a, cc);
+				}
 			}
 			objs.set(id, a); // early: array self-cycles resolve
 			switch (kind) {
