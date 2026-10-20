@@ -232,6 +232,19 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
   - Tests `SnapshotTest` ×7: round-trip worker (same-vm + fresh-vm),
     heap identity/cycles/intern, wait-restore, sleep-delta, parked
     replay, unhandled-host refusal, built-in handles.
+- M5b adapter integration (Oct 2025, JL-Modern `6149790d`) — codecs +
+  shell wiring live in the app repo (`org.snapvm.adapter.SnapHandles`
+  for host objects: Image/Font/Graphics/Player/RecordStore/Command/
+  Ticker/Item/Sprite/TiledLayer; `javax.microedition.lcdui.SnapStateCodecs`
+  for Displayable/Canvas shadows). `SnapVm.saveGame/loadGame` writes
+  `Config.MIDLET_SNAPSHOTS_DIR/<game>/snap0.svm`; restore rebinds the
+  rebuilt midlet (`MidletThread.rebindMidlet`) and re-shows the
+  saved-current Displayable via info the codecs report back
+  (`reportRestoredMidlet`/`requestCurrent`) — codec.restore() runs per
+  reconstructed shadow, so the adapter collects rebind targets there
+  without touching the VM. Verified on-device end-to-end: 722KB save at
+  character-select → advance → restore returns exactly to save point,
+  post-restore keys reach the NEW canvas shadow (no stale refs).
 - On-device diagnostic notes:
   - `System.err` goes to `/dev/null` on Android — all GuestCall/
     GuestThrow/uncaught output is invisible unless the adapter
@@ -241,5 +254,23 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     the log are separate files).
   - `Interpreter.TRACE_CALLS` is a `.matches()` regex — use `.*x.*`
     shapes, not bare substrings.
+  - **`TRACE_CALLS`/`GuestCall` does NOT cover host→guest calls** —
+    `callFromHost` (every keyPressed/paint/serviceRepaints injection)
+    bypasses `Interpreter.invoke`, so "0 GuestCall lines for keyXxx"
+    proves nothing about input delivery. The adapter's `CanvasForward`
+    `fwd` log is the observable point for those.
+  - **AYANEO device sets `log.tag=I` globally** — every `Log.d` in the
+    app is silently dropped. Never infer "code didn't run" from "no
+    log"; use `Log.i` for must-see diagnostics there (or check
+    `getprop log.tag` first).
+  - Injected input is unreliable on that device: shell `sendevent`
+    needs root, `input tap` touch events are blocked by a fullscreen
+    `com.ayaneo.home` overlay (`touchOcclusionMode=BLOCK_UNTRUSTED`),
+    and `input keyevent`'s ~20ms press falls between polling reads of
+    hold-to-poll games. The DEBUG-only `KEYINJECT` broadcast receiver
+    in `MicroActivity` (down/up as separate broadcasts, fully
+    controllable) is the reliable injection path — and note
+    `RECEIVER_NOT_EXPORTED` silently drops shell broadcasts with no
+    logcat trace.
   - `dumpThreads(true)` prints live + terminated threads and a
     locals[0] field summary (Vector sizes show as `size=N`).
