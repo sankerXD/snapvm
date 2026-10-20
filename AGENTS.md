@@ -326,3 +326,21 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     of `getAllStackTraces` otherwise dominates the histogram. Cheap and
     decisive for "where does interpreter wall-time go"; JL-Modern wires
     it to the `snapvm.sample` marker. Test: `samplesAttributeGuestFrames`.
+- M5d stale-graph guard (Oct 2025) — 三国志-赤壁 restore auto-paused:
+  `loadGame`→`setCurrent` detaches the OLD canvas (surfaceDestroyed →
+  queued hideNotify) then attaches the restored shadow. The old shadow's
+  guest object belongs to the discarded graph BUT its `VmClass` is the
+  same instance — statics are shared — so a stale `a.hideNotify()`
+  forwarded via `callFromHost` wrote `u=9` (this game's auto-pause flag)
+  into LIVE class state. Fixes:
+  - `Vm.epoch` bumps per `restore`; `VmObject` stamps `clazz.vm.epoch`
+    at construction; `callFromHost` drops receivers from a discarded
+    epoch (stderr `GuestDrop`). One door catches stale shadows' queued
+    paint/keys/notify regardless of which adapter path delivers them.
+  - `GuestShadow.suppressNextLifecycleNotify()` + per-shadow one-shot
+    flag in the adapter: the RESTORED shadow's synthetic showNotify is
+    a live-guest call that is still semantically wrong (guest POV the
+    canvas never left the screen), so the epoch check can't cover it.
+  - Test: `staleObjectCallsDropped` — pre-restore VmObject's putstatic
+    would hit shared statics; asserts the call is dropped AND a live
+    receiver still runs.

@@ -204,6 +204,28 @@ public class SnapshotTest {
 		assertEquals(7, run(vm, "Bc", "poke"));
 	}
 
+	// A VmObject held across restore belongs to the discarded graph — but
+	// statics live in the SHARED VmClass, so forwarding a queued host callback
+	// (e.g. a detached Canvas shadow's hideNotify) into it would scribble on
+	// LIVE class state. callFromHost drops stale-epoch receivers instead.
+	@Test
+	public void staleObjectCallsDropped() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class St {"
+						+ " static int marker; static St last;"
+						+ " public static Object make() { return last = new St(); }"
+						+ " void poke() { marker = 7; }"
+						+ " public static int check() { return marker; }"
+						+ " public static int pokeLive() { last.poke(); return marker; } }");
+		Vm vm = vm(cls);
+		Object stale = vm.invokeStatic("St", "make", "()Ljava/lang/Object;");
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		assertNull(vm.callFromHost(stale, "poke", "()V"));
+		assertEquals(0, run(vm, "St", "check")); // stale poke() never ran
+		assertEquals(7, run(vm, "St", "pokeLive")); // restored receiver unaffected
+	}
+
 	// TIMED_WAITING comes back still asleep (remaining time), and interrupt()
 	// on the restored thread delivers the exception at the sleep call site.
 	@Test

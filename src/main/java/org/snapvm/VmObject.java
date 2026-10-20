@@ -15,9 +15,12 @@ public final class VmObject {
 	Object[] superCtorArgs;
 	Object exceptionCause;                 // set by Throwable.initCause
 	String exceptionTrace;                 // guest stack captured at construction (printStackTrace)
+	/** Vm.epoch at construction — stale-graph detection for callFromHost. */
+	final int epoch;
 
 	VmObject(VmClass clazz) {
 		this.clazz = clazz;
+		this.epoch = clazz.vm.epoch;
 		this.fields = clazz.fieldDefaults != null
 				? clazz.fieldDefaults.clone()
 				: new Object[clazz.instanceSlotCount];

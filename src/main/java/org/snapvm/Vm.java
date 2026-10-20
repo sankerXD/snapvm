@@ -48,6 +48,13 @@ public final class Vm {
 	final Map<Class<?>, ShadowCodec> shadowCodecs = new HashMap<>();
 	private final Object lock = new Object();
 	private final Object execLock = new Object(); // serializes all guest execution
+	/**
+	 * Bumped on every {@link #restore}: VmObjects stamp it at construction, so
+	 * host code holding a pre-restore reference (a detached Canvas shadow still
+	 * draining queued paint/hideNotify events) can't run guest code that writes
+	 * into the live graph — statics are shared across epochs via VmClass.
+	 */
+	int epoch;
 	/** guest-visible thread key (host Thread or VmObject for guest-extends-Thread) -> green thread */
 	final IdentityHashMap<Object, VmThread> greenThreads = new IdentityHashMap<>();
 	// package-visible for VmSampler's guest-frame attribution
@@ -1045,6 +1052,12 @@ public final class Vm {
 	 */
 	public Object callFromHost(final Object recv, final String name, final String desc,
 			final Object... args) {
+		if (recv instanceof VmObject && ((VmObject) recv).epoch != epoch) {
+			// receiver belongs to a discarded pre-restore graph — dropping the
+			// call; anything it touched would corrupt the live graph's statics
+			System.err.println("GuestDrop: " + name + desc + " on stale " + recv);
+			return null;
+		}
 		VmThread cur;
 		if (Thread.currentThread() == executorThread && (cur = executor) != null) {
 			if (!(recv instanceof VmObject)) {
@@ -1390,6 +1403,7 @@ public final class Vm {
 	 */
 	public void restore(byte[] snap) {
 		synchronized (execLock) {
+			epoch++;
 			Snapshot.read(this, snap);
 		}
 	}

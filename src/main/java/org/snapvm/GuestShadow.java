@@ -9,4 +9,15 @@ package org.snapvm;
  */
 public interface GuestShadow {
 	VmObject guest();
+
+	/**
+	 * Swallow the next lifecycle notification (showNotify/hideNotify) instead
+	 * of forwarding it into the guest. Used when a shadow is resurrected by a
+	 * snapshot restore: the re-show is a host-side reconstruction, not a real
+	 * hide→show transition — from the guest's perspective the canvas never
+	 * left the screen. Games that auto-pause in showNotify/hideNotify would
+	 * otherwise pop their pause UI on every load.
+	 */
+	default void suppressNextLifecycleNotify() {
+	}
 }
