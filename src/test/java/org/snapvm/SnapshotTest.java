@@ -351,4 +351,35 @@ public class SnapshotTest {
 		vm.restore(snap);
 		assertEquals(3, run(vm, "Dh", "check"));
 	}
+
+	// Rainbow Six Vegas parks a jar-resource stream inside a static
+	// DataInputStream between level loads — the wrapper has no buffering,
+	// so the codec captures FilterInputStream.in and the wrapped
+	// ByteArrayInputStream travels through its own handle. Both a raw
+	// InputStream field and the wrapper sit in guest statics here, the
+	// game's exact shape.
+	@Test
+	public void dataInputStreamRoundTrip() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Di {"
+						+ " static java.io.InputStream raw; static java.io.DataInputStream dis;"
+						+ " public static int go() throws Exception {"
+						+ "  raw = new java.io.ByteArrayInputStream("
+						+ "      new byte[]{0, 0, 0, 1, 0, 0, 0, 2, 9});"
+						+ "  dis = new java.io.DataInputStream(raw);"
+						+ "  return dis.readInt();"              // consumes 4 of 9
+						+ " }"
+						+ " public static int check() throws Exception {"
+						+ "  return dis.readInt() * 100 + dis.read();" // 2*100 + 9
+						+ " } }");
+		Vm vm = vm(cls);
+		assertEquals(1, run(vm, "Di", "go"));
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		assertEquals(209, run(vm, "Di", "check"));
+
+		Vm fresh = vm(cls);
+		fresh.restore(snap);
+		assertEquals(209, run(fresh, "Di", "check"));
+	}
 }

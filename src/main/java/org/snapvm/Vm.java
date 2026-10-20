@@ -201,6 +201,40 @@ public final class Vm {
 				return new java.util.Date((Long) rec);
 			}
 		});
+		// Games park resource streams in statics wrapped as DataInputStream
+		// (Rainbow Six Vegas: getResourceAsStream -> static DataInputStream).
+		// The wrapper adds no buffering of its own — its whole observable
+		// state is "the remaining bytes", captured through the same
+		// mark/read/reset trick as the bare-stream codec. No JDK internals
+		// (setAccessible on FilterInputStream.in is module-blocked on JDK9+).
+		registerHostHandle(java.io.DataInputStream.class, new HostHandle() {
+			public Object capture(Vm vm, Object h) {
+				java.io.DataInputStream dis = (java.io.DataInputStream) h;
+				if (!dis.markSupported()) {
+					// draining it would mutate live state — refuse loudly
+					throw new VmError("DataInputStream over a non-markable"
+							+ " stream — cannot snapshot");
+				}
+				try {
+					dis.mark(Integer.MAX_VALUE);
+					java.io.ByteArrayOutputStream bos =
+							new java.io.ByteArrayOutputStream();
+					byte[] buf = new byte[8192];
+					for (int n; (n = dis.read(buf)) > 0; ) {
+						bos.write(buf, 0, n);
+					}
+					dis.reset();
+					return bos.toByteArray();
+				} catch (java.io.IOException e) {
+					throw new VmError("DataInputStream capture failed", e);
+				}
+			}
+
+			public Object revive(Vm vm, Object rec) {
+				return new java.io.DataInputStream(
+						new ByteArrayInputStream((byte[]) rec));
+			}
+		});
 	}
 
 	/**
