@@ -286,3 +286,36 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     logcat trace.
   - `dumpThreads(true)` prints live + terminated threads and a
     locals[0] field summary (Vector sizes show as `size=N`).
+- M5c perf fix — DNF 4-FPS (Oct 2025): paint was ~190ms/frame. Stack
+  sampling the two VM threads showed ~55% of samples inside `monExit`'s
+  `synchronized(threads)` all-thread scan. CLDC `java/util/Vector` ships
+  as guest classdata with synchronized methods AND built-in fastCalls —
+  every elementAt/size goes through the cacheFast path which wraps calls
+  in monEnter/monExit, so DNF's AnimationLoader loop (hundreds of
+  getElement/frame, each with elementAt+toString+parseInt) ran the full
+  threads-list scan thousands of times per frame, and it grows with dead
+  threads (terminate() never removes them). Fixes:
+  - `Monitor.contenders`: per-monitor list of BLOCKED-on-entry threads;
+    monExit/objWait/releaseMonitors wake from it (O(contenders)) instead
+    of scanning `threads`. objNotify moves waiters into contenders when
+    flipping them BLOCKED. `reacquire` re-lists a thread whose entry was
+    pruned mid-wake (lost-wakeup guard). Snapshot restore re-adds BLOCKED
+    threads to their monitor's contenders (Snapshot W_MONITOR case).
+  - `HostBridge.call0` cached `Class.forName` per owner (`hostClasses`)
+    — ART's forName walks the classloader every call (ICU internals show
+    in stack samples).
+  - `registerLangFastCalls`: Object.toString/equals/hashCode,
+    String.length/charAt/equals/substring/indexOf/trim/startsWith/
+    valueOf(prim), Integer.parseInt/toString/intValue, Long.parseLong/
+    longValue, Math.abs/min/max — all the reflect-path calls DNF spammed.
+    `call0`'s `args[0] instanceof VmObject` guard keeps guest receivers
+    on the guest path; `unshadow` preserves shadow-equality semantics.
+  - Result on device: paint 190ms -> ~10ms, ~4 FPS -> ~13 FPS (the
+    game's own ~60ms pacing target). Tests: `blockedContenderRestored`
+    (snapshot of a BLOCKED thread wakes via contenders), `langFastCalls`
+    (value parity vs reflect path), plus existing monitorContention/
+    waitNotify still green.
+  - Diagnostic that cracked it: a 9ms-cadence `Thread.getAllStackTraces`
+    sampler filtering stacks containing org.snapvm frames, leaf-frame
+    histogram — ~50 LoC, gated by a marker file, removed after use.
+    Cheap and decisive for "where does interpreter wall-time go".

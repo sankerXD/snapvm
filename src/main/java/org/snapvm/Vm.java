@@ -57,6 +57,10 @@ public final class Vm {
 		VmThread owner;
 		int count;
 		final List<VmThread> waiters = new ArrayList<>();
+		// threads BLOCKED trying to enter this monitor — replaces the old
+		// O(threads) wake scan on every monExit (hot: CLDC Vector ops are
+		// synchronized, games call them thousands of times per frame)
+		final List<VmThread> contenders = new ArrayList<>();
 	}
 
 	public Vm() {
@@ -81,7 +85,82 @@ public final class Vm {
 			}
 		});
 		registerCldcFastCalls();
+		registerLangFastCalls();
 		registerDefaultHandles();
+	}
+
+	/**
+	 * Fast paths for trivial host-side java.lang calls that games hammer every
+	 * frame (Object.toString on host objects, Integer.parseInt of animation
+	 * table strings, String.equals...). Each skips the reflective pipeline —
+	 * the call0 guard already excludes VmObject receivers on virtual sites, so
+	 * guest receivers keep their guest dispatch and only real host objects
+	 * reach these lambdas. Kind 2 (invokespecial) shares the map — acceptable
+	 * since javac never emits invokespecial for these leaf methods.
+	 */
+	private void registerLangFastCalls() {
+		// Object.* on host receivers only (VmObject recv skips fastCall lookup)
+		registerFastCall("java/lang/Object.toString()Ljava/lang/String;",
+				a -> a[0].toString());
+		registerFastCall("java/lang/Object.hashCode()I", a -> a[0].hashCode());
+		registerFastCall("java/lang/Object.equals(Ljava/lang/Object;)Z",
+				a -> a[0].equals(unshadow(a[1])));
+		// String leaf calls
+		registerFastCall("java/lang/String.toString()Ljava/lang/String;", a -> a[0]);
+		registerFastCall("java/lang/String.length()I",
+				a -> ((String) a[0]).length());
+		registerFastCall("java/lang/String.charAt(I)C",
+				a -> (int) ((String) a[0]).charAt((Integer) a[1]));
+		registerFastCall("java/lang/String.equals(Ljava/lang/Object;)Z",
+				a -> a[0].equals(unshadow(a[1])));
+		registerFastCall("java/lang/String.substring(I)Ljava/lang/String;",
+				a -> ((String) a[0]).substring((Integer) a[1]));
+		registerFastCall("java/lang/String.substring(II)Ljava/lang/String;",
+				a -> ((String) a[0]).substring((Integer) a[1], (Integer) a[2]));
+		registerFastCall("java/lang/String.indexOf(I)I",
+				a -> ((String) a[0]).indexOf((Integer) a[1]));
+		registerFastCall("java/lang/String.trim()Ljava/lang/String;",
+				a -> ((String) a[0]).trim());
+		registerFastCall("java/lang/String.startsWith(Ljava/lang/String;)Z",
+				a -> ((String) a[0]).startsWith((String) a[1]));
+		registerFastCall("java/lang/String.valueOf(I)Ljava/lang/String;",
+				a -> String.valueOf((Integer) a[0]));
+		registerFastCall("java/lang/String.valueOf(J)Ljava/lang/String;",
+				a -> String.valueOf((Long) a[0]));
+		registerFastCall("java/lang/String.valueOf(Z)Ljava/lang/String;",
+				a -> String.valueOf((Integer) a[0] != 0));
+		// Integer
+		registerFastCall("java/lang/Integer.parseInt(Ljava/lang/String;)I",
+				a -> Integer.parseInt((String) a[0]));
+		registerFastCall("java/lang/Integer.parseInt(Ljava/lang/String;I)I",
+				a -> Integer.parseInt((String) a[0], (Integer) a[1]));
+		registerFastCall("java/lang/Integer.toString()Ljava/lang/String;",
+				a -> a[0].toString());
+		registerFastCall("java/lang/Integer.toString(I)Ljava/lang/String;",
+				a -> Integer.toString((Integer) a[0]));
+		registerFastCall("java/lang/Integer.toString(II)Ljava/lang/String;",
+				a -> Integer.toString((Integer) a[0], (Integer) a[1]));
+		registerFastCall("java/lang/Integer.intValue()I", a -> a[0]);
+		// Long
+		registerFastCall("java/lang/Long.parseLong(Ljava/lang/String;)J",
+				a -> Long.parseLong((String) a[0]));
+		registerFastCall("java/lang/Long.toString()Ljava/lang/String;",
+				a -> a[0].toString());
+		registerFastCall("java/lang/Long.longValue()J", a -> a[0]);
+		// Math leaf calls
+		registerFastCall("java/lang/Math.abs(I)I", a -> Math.abs((Integer) a[0]));
+		registerFastCall("java/lang/Math.abs(J)J", a -> Math.abs((Long) a[0]));
+		registerFastCall("java/lang/Math.min(II)I",
+				a -> Math.min((Integer) a[0], (Integer) a[1]));
+		registerFastCall("java/lang/Math.max(II)I",
+				a -> Math.max((Integer) a[0], (Integer) a[1]));
+	}
+
+	/** unwrap a guest object's host shadow for host-side equality checks. */
+	private static Object unshadow(Object v) {
+		if (v instanceof VmObject && ((VmObject) v).hostShadow != null)
+			return ((VmObject) v).hostShadow;
+		return v;
 	}
 
 	/**
@@ -625,7 +704,25 @@ public final class Vm {
 			}
 			t.state = VmThread.BLOCKED;
 			t.waitMonitor = m;
+			m.contenders.add(t);
 			return false;
+		}
+	}
+
+	/** Wake one thread BLOCKED entering m; prunes stale entries while here.
+	 *  Caller must hold synchronized(m). */
+	private static void wakeContender(Monitor m) {
+		boolean woke = false;
+		for (int i = 0; i < m.contenders.size(); i++) {
+			VmThread w = m.contenders.get(i);
+			if (w.state != VmThread.BLOCKED || w.waitMonitor != m) {
+				m.contenders.remove(i--); // reacquired / terminated / notified-away
+				continue;
+			}
+			if (!woke) {
+				w.state = VmThread.RUNNABLE;
+				woke = true;
+			}
 		}
 	}
 
@@ -638,14 +735,7 @@ public final class Vm {
 			if (--m.count == 0) {
 				m.owner = null;
 				// wake one blocked contender so it can retry monEnter
-				synchronized (threads) {
-					for (VmThread w : threads) {
-						if (w.state == VmThread.BLOCKED && w.waitMonitor == m) {
-							w.state = VmThread.RUNNABLE;
-							break;
-						}
-					}
-				}
+				wakeContender(m);
 			}
 		}
 	}
@@ -670,14 +760,7 @@ public final class Vm {
 			t.waitMonitor = m;
 			t.waitReleasedCount = released;
 			t.resumingFromWait = true;
-			synchronized (threads) {
-				for (VmThread w : threads) {
-					if (w.state == VmThread.BLOCKED && w.waitMonitor == m) {
-						w.state = VmThread.RUNNABLE;
-						break;
-					}
-				}
-			}
+			wakeContender(m);
 		}
 	}
 
@@ -690,6 +773,7 @@ public final class Vm {
 			for (int i = 0; i < n; i++) {
 				VmThread w = m.waiters.remove(0);
 				w.state = VmThread.BLOCKED; // must reacquire; Interpreter retries monEnter
+				m.contenders.add(w);
 			}
 		}
 	}
@@ -1397,13 +1481,9 @@ public final class Vm {
 						m.owner = null;
 						m.count = 0;
 					}
+					if (m.owner == null)
+						wakeContender(m); // contenders re-contend or re-park
 				}
-		}
-		synchronized (threads) {
-			for (VmThread w : threads)
-				if (w.state == VmThread.BLOCKED && w.waitMonitor instanceof Monitor
-						&& ((Monitor) w.waitMonitor).owner == null)
-					w.state = VmThread.RUNNABLE; // re-contends or re-parks
 		}
 	}
 }

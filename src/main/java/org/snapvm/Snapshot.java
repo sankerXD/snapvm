@@ -571,6 +571,8 @@ final class Snapshot {
 					break;
 				case W_MONITOR:
 					t.waitMonitor = vm.monitorOf(value());
+					if (t.state == VmThread.BLOCKED)
+						((Vm.Monitor) t.waitMonitor).contenders.add(t);
 					break;
 				case W_PARKED:
 					t.waitMonitor = Vm.PARKED;

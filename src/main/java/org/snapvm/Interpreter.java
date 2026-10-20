@@ -88,6 +88,10 @@ public final class Interpreter {
 				return true;
 			}
 			t.state = VmThread.BLOCKED;
+			// lost-wakeup guard: the contender entry may have been pruned while
+			// this thread was RUNNABLE between wake and reacquire — re-list it
+			if (!m.contenders.contains(t))
+				m.contenders.add(t);
 			return false;
 		}
 	}

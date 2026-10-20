@@ -1158,6 +1158,36 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		assertEquals(495, run(vm, "Fb", "go"));
 	}
 
+	/** java.lang host fast-calls: Object.* on real host receivers, String leaf
+	 *  methods, Integer/Long conversions. call0 only consults fastCalls when
+	 *  the receiver isn't a VmObject — these values must match the reflective
+	 *  route exactly. */
+	@Test
+	public void langFastCalls() throws Exception {
+		Vm vm = vm(compile(
+				"public class Lf { public static int go() {"
+						+ "  int r = 0;"
+						+ "  Object o = \"zz\";"
+						+ "  r += o.toString().length();"              // 2
+						+ "  Object i = Integer.valueOf(7);"
+						+ "  r += i.toString().length();"              // 1
+						+ "  r += o.equals(\"zz\") ? 4 : 0;"
+						+ "  r += i.equals(Integer.valueOf(7)) ? 8 : 0;"
+						+ "  r += !i.equals(o) ? 16 : 0;"
+						+ "  r += o.hashCode() == \"zz\".hashCode() ? 32 : 0;"
+						+ "  r += \"abc\".charAt(1);"                  // 98
+						+ "  r += \"  x \".trim().length();"           // 1
+						+ "  r += \"abc\".startsWith(\"ab\") ? 64 : 0;"
+						+ "  r += String.valueOf(42).length();"        // 2
+						+ "  r += String.valueOf(true).length();"      // 4
+						+ "  r += String.valueOf(5L).length();"        // 1
+						+ "  r += Integer.valueOf(7).toString().length();" // 1
+						+ "  r += Integer.parseInt(\"ff\", 16);"       // 255
+						+ "  r += (int) Long.parseLong(\"9\");"        // 9
+						+ "  return r; } }"));
+		assertEquals(498, run(vm, "Lf", "go"));
+	}
+
 	@Test
 	public void stringMarshalGuest() throws Exception {
 		Vm vm = vm(compile(

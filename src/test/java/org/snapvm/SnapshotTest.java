@@ -173,6 +173,37 @@ public class SnapshotTest {
 		assertEquals(42, run(vm, "Wt", "poke"));
 	}
 
+	// A thread BLOCKED on monitor entry serializes its waitMonitor; the
+	// per-monitor contenders list must be rebuilt on restore or the owner's
+	// monExit wakes nobody and a join() deadlocks. Covers the contenders
+	// queue that replaced the old O(threads) wake scan in monExit.
+	@Test
+	public void blockedContenderRestored() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Bc {"
+						+ " static final Object L = new Object();"
+						+ " static int r; static Thread w;"
+						+ " static class H implements Runnable { public void run() {"
+						+ "  synchronized (L) {"
+						+ "   try { Thread.sleep(60); } catch (InterruptedException e) {}"
+						+ "  } } }"               // holds L while sleeping
+						+ " static class W implements Runnable { public void run() {"
+						+ "  synchronized (L) { r = 7; } } }" // blocks until H exits
+						+ " public static int go() {"
+						+ "  new Thread(new H()).start();"
+						+ "  w = new Thread(new W()); w.start();"
+						+ "  try { Thread.sleep(20); } catch (InterruptedException e) {}"
+						+ "  return 0; }"         // returns with W BLOCKED on L
+						+ " public static int poke() {"
+						+ "  try { w.join(); } catch (InterruptedException e) { return -1; }"
+						+ "  return r; } }");
+		Vm vm = vm(cls);
+		run(vm, "Bc", "go"); // H holds L (asleep inside sync), W is BLOCKED on it
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		assertEquals(7, run(vm, "Bc", "poke"));
+	}
+
 	// TIMED_WAITING comes back still asleep (remaining time), and interrupt()
 	// on the restored thread delivers the exception at the sleep call site.
 	@Test

@@ -20,6 +20,10 @@ final class HostBridge {
 	private final Map<String, Method> methodCache = new HashMap<>();
 	private final Map<String, Field> fieldCache = new HashMap<>();
 	private final Map<String, Constructor<?>> ctorCache = new HashMap<>();
+	// owner "/" name -> host Class — Class.forName on ART is a classloader
+	// walk (ICU/locale internals show up in profilers); games issue thousands
+	// of host calls per frame so this must be a map hit
+	private final Map<String, Class<?>> hostClasses = new HashMap<>();
 
 	/** diagnostics: per-callsite host-call counts (owner.name). */
 	public final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> callStats =
@@ -205,6 +209,10 @@ final class HostBridge {
 	 * 3 constructor (returns new object, args exclude marker).
 	 */
 	Object call(VmThread t, String ownerName, String name, String desc, Object[] args, int kind) {
+		return call0(t, ownerName, name, desc, args, kind);
+	}
+
+	private Object call0(VmThread t, String ownerName, String name, String desc, Object[] args, int kind) {
 		if (statsOn) {
 			java.util.concurrent.atomic.AtomicLong ctr = callStats.get(ownerName + "." + name);
 			if (ctr == null) {
@@ -237,11 +245,14 @@ final class HostBridge {
 			}
 		}
 
-		Class<?> hc;
-		try {
-			hc = Class.forName(ownerName.replace('/', '.'));
-		} catch (ClassNotFoundException e) {
-			throw new VmError("host class missing " + ownerName);
+		Class<?> hc = hostClasses.get(ownerName);
+		if (hc == null) {
+			try {
+				hc = Class.forName(ownerName.replace('/', '.'));
+			} catch (ClassNotFoundException e) {
+				throw new VmError("host class missing " + ownerName);
+			}
+			hostClasses.put(ownerName, hc);
 		}
 		// guest receiver on a non-Object boundary: Throwable and Object.*
 		// semantics are still VM-provided, not reflective
