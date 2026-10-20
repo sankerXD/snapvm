@@ -890,7 +890,7 @@ public final class Vm {
 				pump();
 				if (!t.isAlive() || canRun(t))
 					continue;
-				if (pendingWork() < 0) {
+				if (pendingWork() < 0 && t.waitMonitor != PARKED) {
 					if (guestDeadlocked())
 						throw new VmError("guest deadlock: no runnable, timed or host-parked thread\n"
 								+ dumpThreads());

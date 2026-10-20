@@ -1300,4 +1300,24 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		System.out.println("benchHostCall: 100000 calls in " + ms + " ms (~"
 				+ (100000000 / Math.max(1, ms)) + " calls/s)");
 	}
+
+	// An entry call parked on a host callback must block until done() fires —
+	// abandoning returned newGuestObject mid-constructor, so 傲剑江湖's
+	// iApp.<init> never ran its putstatic mg and startApp's setCurrent
+	// received null (displayable_container empty → permanent white screen).
+	@Test
+	public void entryCallWaitsForParkedCall() throws Exception {
+		Vm vm = vm(compile(
+				"public class Ep { public static int go() {"
+						+ " new Object().toString(); return 9; } }"));
+		vm.registerParkedCall("java/lang/Object.toString()Ljava/lang/String;",
+				(v, t, args, done) -> new Thread(() -> {
+					try {
+						Thread.sleep(30);
+					} catch (InterruptedException ignored) {
+					}
+					done.run();
+				}).start());
+		assertEquals(9, vm.invokeStatic("Ep", "go", "()I"));
+	}
 }
