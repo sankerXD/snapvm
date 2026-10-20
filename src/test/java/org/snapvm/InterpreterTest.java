@@ -320,6 +320,74 @@ assertEquals(33, run(vm, "D2X2", "go"));
 		assertEquals(42, run(vm, "Gt", "go"));
 	}
 
+	/**
+	 * A guest thread busy-spinning without ever blocking must not starve
+	 * threads scheduled after it. Silent Hill 3's render loop spins on
+	 * Canvas.isShown() with no sleep; first-runnable-wins scheduling then
+	 * starved the main-loop thread created later and the screen stayed
+	 * black. Real J2ME threads are preemptive — the green scheduler must
+	 * round-robin.
+	 */
+	@Test
+	public void roundRobinScheduling() throws Exception {
+		Vm vm = vm(compile(
+				"public class Rr { static int flag;"
+						+ " public static void spin() { for (;;) {} }"
+						+ " public static void fin() { flag = 42; }"
+						+ " public static int get() { return flag; }"
+						+ " public static int go() {"
+						+ "  new Thread(new Runnable() { public void run() { spin(); } }).start();"
+						+ "  new Thread(new Runnable() { public void run() { fin(); } }).start();"
+						+ "  return 0; } }"));
+		run(vm, "Rr", "go");
+		for (int i = 0; i < 8; i++)
+			vm.pump(50_000);
+		assertEquals(42, vm.invokeStatic("Rr", "get", "()I"));
+	}
+
+	/** Host fixture: wrapper-typed members for fromHost reference-slot tests. */
+	public static class BoxHolder {
+		public static Short shortField = Short.valueOf((short) 9);
+		public static boolean primBool = true;
+		public static Short box(short v) {
+			return v;
+		}
+	}
+
+	/**
+	 * Silent Hill 3 froze on its Playsoft splash: PointFont.DrawChar stores
+	 * Short.valueOf() results in a Hashtable and later does checkcast
+	 * java/lang/Short — but fromHost normalized every host wrapper to
+	 * Integer, so the checkcast always threw and killed the main-loop
+	 * thread. Reference-typed slots must keep the real wrapper object;
+	 * primitive slots still normalize to Integer.
+	 */
+	@Test
+	public void boxedWrappersKeepIdentity() throws Exception {
+		Vm vm = vm(compile(
+				"public class Bx {"
+						+ " public static int roundTrip() {"
+						+ "  java.util.Hashtable h = new java.util.Hashtable();"
+						+ "  h.put(\"k\", Short.valueOf((short) 7));"
+						+ "  Object o = h.get(\"k\");"
+						+ "  if (!(o instanceof Short)) return -1;"
+						+ "  return ((Short) o).shortValue(); }"
+						+ " public static int takeShort(Short s) { return s.shortValue(); }"
+						+ " public static int fieldRead() {"
+						+ "  return org.snapvm.InterpreterTest.BoxHolder.shortField.shortValue(); }"
+						+ " public static int methodRead() {"
+						+ "  return org.snapvm.InterpreterTest.BoxHolder.box((short) 11).shortValue(); }"
+						+ " public static int primRead() {"
+						+ "  return org.snapvm.InterpreterTest.BoxHolder.primBool ? 3 : 0; } }"));
+		assertEquals(7, run(vm, "Bx", "roundTrip"));
+		assertEquals(9, run(vm, "Bx", "fieldRead"));
+		assertEquals(11, run(vm, "Bx", "methodRead"));
+		assertEquals(3, run(vm, "Bx", "primRead"));
+		// 'L' parameter slot must receive the real Short, not an Integer
+		assertEquals(5, vm.invokeStatic("Bx", "takeShort",
+				"(Ljava/lang/Short;)I", Short.valueOf((short) 5)));
+	}
+
 	@Test
 	public void clinit() throws Exception {
 		Vm vm = vm(compile(
@@ -836,6 +904,52 @@ assertEquals(1001, run(vm, "Sm", "go"));
 	}
 
 	/**
+	 * J2ME games assume jar resources fill a buffer in one read() — real
+	 * devices did that, and JL-Modern's dex path returns ByteArrayInputStream.
+	 * Android's ZipFile inflater short-reads DEFLATED entries (Silent Hill 3:
+	 * 468/471 on _bb → signature check at l._q@141 fails → notifyDestroyed).
+	 * getResource must buffer; a hostile 1-byte-per-read source proves it.
+	 */
+	@Test
+	public void jarResourceReadFills() throws Exception {
+		Map<String, byte[]> classes = compile(
+				"public class Jr { public static int go() throws Exception {"
+						+ "  java.io.InputStream in = Jr.class.getResourceAsStream(\"/blob.bin\");"
+						+ "  if (in == null) return -1;"
+						+ "  byte[] buf = new byte[471];"
+						+ "  int n = in.read(buf);"
+						+ "  in.close();"
+						+ "  return n + buf[470];"
+						+ " } }");
+		final byte[] blob = new byte[471];
+		blob[470] = 7; // tail byte — only seen if the read actually filled
+		Vm vm = new Vm();
+		vm.addClassSource(new Vm.ClassSource() {
+			public byte[] findClass(String name) {
+				return classes.get(name.replace('/', '.'));
+			}
+
+			public InputStream findResource(String path) {
+				if (!path.equals("blob.bin"))
+					return null;
+				return new InputStream() {
+					int pos;
+					public int read() {
+						return pos < blob.length ? blob[pos++] & 0xff : -1;
+					}
+					public int read(byte[] b, int off, int len) {
+						if (pos >= blob.length)
+							return -1;
+						b[off] = blob[pos++];
+						return 1;
+					}
+				};
+			}
+		});
+		assertEquals(478, vm.invokeStatic("Jr", "go", "()I"));
+	}
+
+	/**
 	 * The JDK fast-paths (Vector/StringBuffer/String/Math/IO) must behave
 	 * identically to the reflective route — same results, same exceptions.
 	 */
@@ -891,6 +1005,89 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		assertEquals(5, run(vm, "Sg", "a"));
 		assertEquals(2, run(vm, "Sg", "b"));
 		assertEquals(7, run(vm, "Sg", "c"));
+	}
+
+	/**
+	 * Guest CLDC Vector leaf ops are registered as fast calls — they must
+	 * behave identically to the interpreted bodies: grow policy, shifting,
+	 * tail nulling, and the exact exception types a guest catch sees.
+	 */
+	@Test
+	public void vectorFastCalls() throws Exception {
+		Vm vm = vm(compile(
+				"import java.util.Vector;\n"
+						+ "public class Vf { public static int go() {"
+						+ "  Vector v = new Vector();"
+						+ "  for (int i = 0; i < 300; i++) v.addElement(Integer.valueOf(i));"
+						+ "  int sum = v.size();"                             // +300
+						+ "  sum += ((Integer) v.elementAt(299)).intValue();"   // +299
+						+ "  v.setElementAt(Integer.valueOf(7), 0);"
+						+ "  sum += ((Integer) v.firstElement()).intValue();"   // +7
+						+ "  sum += ((Integer) v.lastElement()).intValue();"    // +299
+						+ "  sum += ((Integer) v.get(1)).intValue();"           // +1
+						+ "  v.insertElementAt(Integer.valueOf(5), 0);"
+						+ "  sum += ((Integer) v.elementAt(0)).intValue() + v.size();" // +5+301
+						+ "  v.removeElementAt(0);"
+						+ "  sum += v.size();"                                  // +300
+						+ "  sum += v.capacity() >= 300 ? 1 : 0;"               // +1
+						+ "  v.setSize(5);"
+						+ "  sum += v.size() + ((Integer) v.elementAt(4)).intValue();" // +5+4
+						+ "  sum += v.toArray().length;"                        // +5
+						+ "  v.removeAllElements();"
+						+ "  sum += v.isEmpty() ? 10 : 0;"                      // +10
+						+ "  sum += v.size();"                                  // +0
+						+ "  int caught = 0;"
+						+ "  try { v.elementAt(0); }"
+						+ "  catch (ArrayIndexOutOfBoundsException e) { caught = 40; }"
+						+ "  sum += caught;"                                    // +40
+						+ "  try { v.firstElement(); }"
+						+ "  catch (java.util.NoSuchElementException e) { caught = 50; }"
+						+ "  sum += caught;"                                    // +50
+						+ "  v.addElement(Integer.valueOf(9)); v.setSize(8);"
+						+ "  sum += v.elementAt(7) == null ? 60 : 0;"           // +60
+						+ "  sum += ((Integer) v.elementAt(0)).intValue();"     // +9
+						+ "  return sum;"                                       // 1696
+						+ " } }"));
+		assertEquals(1696, run(vm, "Vf", "go"));
+	}
+
+	/**
+	 * A guest subclass overriding a fast-called method resolves to its own
+	 * declaring class — the fast call must NOT fire; the override body runs.
+	 */
+	@Test
+	public void vectorFastCallOverride() throws Exception {
+		Vm vm = vm(compile(
+				"public class Vo { static class V2 extends java.util.Vector {"
+						+ "  int hits;"
+						+ "  public synchronized Object elementAt(int i) {"
+						+ "    hits++; return super.elementAt(i); } }"
+						+ "public static int go() {"
+						+ "  V2 v = new V2();"
+						+ "  v.addElement(\"x\");"
+						+ "  Object r = v.elementAt(0);"
+						+ "  return v.hits * 10 + ((String) r).length();"      // 11
+						+ " } }"));
+		assertEquals(11, run(vm, "Vo", "go"));
+	}
+
+	/**
+	 * The dispatch itself: a fast call registered on a plain guest method is
+	 * invoked with raw guest args (receiver at [0]) and its return is pushed
+	 * onto the caller's operand stack.
+	 */
+	@Test
+	public void guestFastCallDispatch() throws Exception {
+		Vm vm = vm(compile(
+				"public class Gd { public int bump(int x) { return -1; }"
+						+ " public static int go() { return new Gd().bump(41); } }"));
+		final int[] hit = {0};
+		vm.registerFastCall("Gd.bump(I)I", a -> {
+			hit[0]++;
+			return ((Integer) a[1]) + 1;
+		});
+		assertEquals(42, run(vm, "Gd", "go"));
+		assertEquals(1, hit[0]);
 	}
 
 	/** Host-call dispatch throughput: Vector.size() in a guest loop. */

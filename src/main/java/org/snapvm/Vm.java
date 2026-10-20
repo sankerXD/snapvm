@@ -1,5 +1,6 @@
 package org.snapvm;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,7 +28,9 @@ public final class Vm {
 
 	final Map<String, VmClass> classes = new HashMap<>();
 	/** Dead frames available for reuse — avoids locals/stack array churn per call. */
-	final java.util.ArrayDeque<Frame> framePool = new java.util.ArrayDeque<>();
+	// pooled frames bucketed by exact array sizes — call/return pairs of the
+	// same methods reuse with a single map hit instead of a linear fit-scan
+	final java.util.Map<Integer, java.util.ArrayDeque<Frame>> framePools = new java.util.HashMap<>();
 	final Map<String, String> interned = new HashMap<>();
 	final IdentityHashMap<Object, Monitor> monitors = new IdentityHashMap<>();
 	final IdentityHashMap<Object, Object> proxies = new IdentityHashMap<>();   // proxy -> guest obj
@@ -39,6 +42,7 @@ public final class Vm {
 
 	private final List<ClassSource> sources = new ArrayList<>();
 	private final List<VmThread> threads = new ArrayList<>();
+	private int rrCursor; // round-robin scan start; a busy thread must not starve later ones
 	private final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
 	private final Object lock = new Object();
 	private final Object execLock = new Object(); // serializes all guest execution
@@ -74,6 +78,183 @@ public final class Vm {
 				return null;
 			}
 		});
+		registerCldcFastCalls();
+	}
+
+	/**
+	 * Fast paths for the bundled guest CLDC Vector's leaf methods. They read
+	 * and write the receiver's guest fields directly — no interpreted frame,
+	 * no reflection, and all state stays in the VmObject (snapshot-safe).
+	 * Overridden methods in guest subclasses resolve to the subclass decl and
+	 * never reach these lambdas.
+	 */
+	private void registerCldcFastCalls() {
+		registerFastCall("java/util/Vector.size()I",
+				a -> ((VmObject) a[0]).fields[vslot((VmObject) a[0], "elementCount|I")]);
+		registerFastCall("java/util/Vector.isEmpty()Z",
+				a -> (Integer) ((VmObject) a[0]).fields[vslot((VmObject) a[0],
+						"elementCount|I")] == 0);
+		registerFastCall("java/util/Vector.capacity()I",
+				a -> ((Object[]) ((VmObject) a[0]).fields[vslot((VmObject) a[0],
+						"elementData|[Ljava/lang/Object;")]).length);
+		registerFastCall("java/util/Vector.elementAt(I)Ljava/lang/Object;", a -> {
+			VmObject v = (VmObject) a[0];
+			int i = (Integer) a[1];
+			if (i >= (Integer) v.fields[vslot(v, "elementCount|I")])
+				throw new ArrayIndexOutOfBoundsException(i);
+			return ((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[i];
+		});
+		registerFastCall("java/util/Vector.get(I)Ljava/lang/Object;", a -> {
+			VmObject v = (VmObject) a[0];
+			int i = (Integer) a[1];
+			if (i >= (Integer) v.fields[vslot(v, "elementCount|I")])
+				throw new ArrayIndexOutOfBoundsException(i);
+			return ((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[i];
+		});
+		registerFastCall("java/util/Vector.firstElement()Ljava/lang/Object;", a -> {
+			VmObject v = (VmObject) a[0];
+			if ((Integer) v.fields[vslot(v, "elementCount|I")] == 0)
+				throw new java.util.NoSuchElementException();
+			return ((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[0];
+		});
+		registerFastCall("java/util/Vector.lastElement()Ljava/lang/Object;", a -> {
+			VmObject v = (VmObject) a[0];
+			int n = (Integer) v.fields[vslot(v, "elementCount|I")];
+			if (n == 0)
+				throw new java.util.NoSuchElementException();
+			return ((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[n - 1];
+		});
+		registerFastCall("java/util/Vector.setElementAt(Ljava/lang/Object;I)V", a -> {
+			VmObject v = (VmObject) a[0];
+			int i = (Integer) a[2];
+			if (i >= (Integer) v.fields[vslot(v, "elementCount|I")])
+				throw new ArrayIndexOutOfBoundsException(i);
+			((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[i] = a[1];
+			return null;
+		});
+		registerFastCall("java/util/Vector.setSize(I)V", a -> {
+			VmObject v = (VmObject) a[0];
+			int ns = (Integer) a[1];
+			int ci = vslot(v, "elementCount|I");
+			int n = (Integer) v.fields[ci];
+			if (ns > n) {
+				vgrow(v, ns);
+			} else {
+				Object[] d = (Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")];
+				for (int i = ns; i < n; i++)
+					d[i] = null;
+			}
+			v.fields[ci] = ns;
+			return null;
+		});
+		registerFastCall("java/util/Vector.ensureCapacity(I)V", a -> {
+			vgrow((VmObject) a[0], (Integer) a[1]);
+			return null;
+		});
+		registerFastCall("java/util/Vector.trimToSize()V", a -> {
+			VmObject v = (VmObject) a[0];
+			int di = vslot(v, "elementData|[Ljava/lang/Object;");
+			Object[] d = (Object[]) v.fields[di];
+			int n = (Integer) v.fields[vslot(v, "elementCount|I")];
+			if (d.length > n) {
+				Object[] nd = new Object[n];
+				System.arraycopy(d, 0, nd, 0, n);
+				v.fields[di] = nd;
+			}
+			return null;
+		});
+		registerFastCall("java/util/Vector.addElement(Ljava/lang/Object;)V", a -> {
+			VmObject v = (VmObject) a[0];
+			int ci = vslot(v, "elementCount|I");
+			int n = (Integer) v.fields[ci];
+			vgrow(v, n + 1);
+			((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[n] = a[1];
+			v.fields[ci] = n + 1;
+			return null;
+		});
+		registerFastCall("java/util/Vector.add(Ljava/lang/Object;)Z", a -> {
+			VmObject v = (VmObject) a[0];
+			int ci = vslot(v, "elementCount|I");
+			int n = (Integer) v.fields[ci];
+			vgrow(v, n + 1);
+			((Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")])[n] = a[1];
+			v.fields[ci] = n + 1;
+			return true;
+		});
+		registerFastCall("java/util/Vector.insertElementAt(Ljava/lang/Object;I)V", a -> {
+			VmObject v = (VmObject) a[0];
+			int i = (Integer) a[2];
+			int ci = vslot(v, "elementCount|I");
+			int n = (Integer) v.fields[ci];
+			if (i > n)
+				throw new ArrayIndexOutOfBoundsException(i);
+			vgrow(v, n + 1);
+			Object[] d = (Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")];
+			System.arraycopy(d, i, d, i + 1, n - i);
+			d[i] = a[1];
+			v.fields[ci] = n + 1;
+			return null;
+		});
+		registerFastCall("java/util/Vector.removeElementAt(I)V", a -> {
+			VmObject v = (VmObject) a[0];
+			int i = (Integer) a[1];
+			int ci = vslot(v, "elementCount|I");
+			int n = (Integer) v.fields[ci];
+			if (i >= n)
+				throw new ArrayIndexOutOfBoundsException(i);
+			Object[] d = (Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")];
+			int j = n - i - 1;
+			if (j > 0)
+				System.arraycopy(d, i + 1, d, i, j);
+			d[n - 1] = null;
+			v.fields[ci] = n - 1;
+			return null;
+		});
+		registerFastCall("java/util/Vector.removeAllElements()V", a -> {
+			VmObject v = (VmObject) a[0];
+			Object[] d = (Object[]) v.fields[vslot(v, "elementData|[Ljava/lang/Object;")];
+			int n = (Integer) v.fields[vslot(v, "elementCount|I")];
+			for (int i = 0; i < n; i++)
+				d[i] = null;
+			v.fields[vslot(v, "elementCount|I")] = 0;
+			return null;
+		});
+		registerFastCall("java/util/Vector.copyInto([Ljava/lang/Object;)V", a -> {
+			VmObject v = (VmObject) a[0];
+			System.arraycopy(v.fields[vslot(v, "elementData|[Ljava/lang/Object;")], 0,
+					a[1], 0, (Integer) v.fields[vslot(v, "elementCount|I")]);
+			return null;
+		});
+		registerFastCall("java/util/Vector.toArray()[Ljava/lang/Object;", a -> {
+			VmObject v = (VmObject) a[0];
+			int n = (Integer) v.fields[vslot(v, "elementCount|I")];
+			Object[] r = new Object[n];
+			System.arraycopy(v.fields[vslot(v, "elementData|[Ljava/lang/Object;")], 0,
+					r, 0, n);
+			return r;
+		});
+	}
+
+	private static int vslot(VmObject v, String key) {
+		Integer i = v.clazz.fieldSlots.get(key);
+		if (i == null)
+			throw new VmError("Vector layout missing " + key);
+		return i;
+	}
+
+	/** Mirrors the guest Vector.grow() capacity policy. */
+	private static void vgrow(VmObject v, int minCapacity) {
+		int di = vslot(v, "elementData|[Ljava/lang/Object;");
+		Object[] d = (Object[]) v.fields[di];
+		if (minCapacity <= d.length)
+			return;
+		int inc = (Integer) v.fields[vslot(v, "capacityIncrement|I")];
+		int cap = inc > 0 ? d.length + inc : d.length * 2;
+		if (cap < minCapacity)
+			cap = minCapacity;
+		Object[] nd = new Object[cap];
+		System.arraycopy(d, 0, nd, 0, (Integer) v.fields[vslot(v, "elementCount|I")]);
+		v.fields[di] = nd;
 	}
 
 	/** register a classpath. dirMode: findClass gets "com/foo/Bar" -> bytes. */
@@ -201,8 +382,19 @@ public final class Vm {
 	public InputStream getResource(String path) {
 		for (ClassSource s : sources) {
 			InputStream in = s.findResource(path);
-			if (in != null)
-				return in;
+			if (in != null) {
+				// J2ME jar resources must deliver all bytes in one read():
+				// Android's ZipFile inflater returns short reads on DEFLATED
+				// entries (measured 468/471), which corrupts games that read
+				// a resource into a fixed buffer with a single call.
+				try {
+					byte[] all = readAll(in);
+					in.close();
+					return new ByteArrayInputStream(all);
+				} catch (IOException x) {
+					return null;
+				}
+			}
 		}
 		return null;
 	}
@@ -223,12 +415,18 @@ public final class Vm {
 
 	/** Debug dump: state + top frames of every live green thread. */
 	public String dumpThreads() {
+		return dumpThreads(false);
+	}
+
+	/** deep=true also prints a locals[0] field summary per frame (guest objects only). */
+	public String dumpThreads(boolean deep) {
 		StringBuilder sb = new StringBuilder();
 		synchronized (threads) {
 			for (VmThread t : threads) {
-				if (!t.isAlive())
+				if (!t.isAlive() && !deep)
 					continue;
-				sb.append("state=").append(t.state)
+				sb.append("t#").append(Integer.toHexString(System.identityHashCode(t)))
+						.append(" state=").append(t.state)
 						.append(t.waitMonitor != null ? " waitMon" : "")
 						.append(" frames=").append(t.frames.size()).append('\n');
 				for (int i = t.frames.size() - 1; i >= 0 && i > t.frames.size() - 4; i--) {
@@ -236,10 +434,45 @@ public final class Vm {
 					sb.append("  at ").append(f.owner.name).append('.')
 							.append(f.method.name).append(f.method.desc)
 							.append(" @").append(f.pc).append('\n');
+					if (deep && f.locals.length > 0 && f.locals[0] instanceof VmObject)
+						appendFields(sb, (VmObject) f.locals[0]);
 				}
 			}
 		}
 		return sb.toString();
+	}
+
+	private static void appendFields(StringBuilder sb, VmObject o) {
+		sb.append("    this=").append(o.clazz.name);
+		for (Map.Entry<String, Integer> e : o.clazz.fieldSlots.entrySet()) {
+			Object v = o.fields[e.getValue()];
+			if (v == null)
+				continue;
+			String k = e.getKey();
+			sb.append(' ').append(k, 0, k.indexOf('|')).append('=').append(shortVal(v));
+		}
+		sb.append('\n');
+	}
+
+	private static String shortVal(Object v) {
+		if (v instanceof VmObject) {
+			VmObject o = (VmObject) v;
+			if (o.clazz.name.equals("java/util/Vector")) {
+				Integer slot = o.clazz.fieldSlots.get("elementCount|I");
+				Object n = slot == null ? "?" : o.fields[slot];
+				return "Vector#" + Integer.toHexString(System.identityHashCode(o))
+						+ "(size=" + n + ")";
+			}
+			return o.clazz.name + "#" + Integer.toHexString(System.identityHashCode(o));
+		}
+		if (v instanceof Object[])
+			return "Obj[" + ((Object[]) v).length + "]";
+		if (v instanceof byte[])
+			return "byte[" + ((byte[]) v).length + "]";
+		if (v instanceof int[])
+			return "int[" + ((int[]) v).length + "]";
+		String s = String.valueOf(v);
+		return s.length() > 24 ? s.substring(0, 24) : s;
 	}
 
 	/** Debug: flattened view of a guest object's instance fields (name|desc -> value). */
@@ -274,6 +507,25 @@ public final class Vm {
 		bridge.statsOn = on;
 	}
 
+	/** diagnostics: sampling profiler — when on, each pump slice attributes a
+	 *  time-weighted sample to the method on top of the slice's thread stack. */
+	public volatile boolean profileOn;
+	public final java.util.Map<String, java.util.concurrent.atomic.AtomicLong> profStats =
+			new java.util.HashMap<>();
+
+	private void profSample(VmThread t) {
+		Frame f = t.top();
+		if (f == null)
+			return;
+		String k = f.owner.name + "." + f.method.name + f.method.desc;
+		synchronized (profStats) {
+			java.util.concurrent.atomic.AtomicLong c = profStats.get(k);
+			if (c == null)
+				profStats.put(k, c = new java.util.concurrent.atomic.AtomicLong());
+			c.incrementAndGet();
+		}
+	}
+
 	/** run the scheduler until idle or budget (total instructions) exhausted. */
 	public void pump(long budget) {
 		synchronized (execLock) {
@@ -283,6 +535,8 @@ public final class Vm {
 				if (t == null)
 					break;
 				used += runSlice(t, budget > 0 ? Math.max(1, budget - used) : Long.MAX_VALUE);
+				if (profileOn)
+					profSample(t);
 				if (budget > 0 && used >= budget)
 					break;
 			}
@@ -293,11 +547,16 @@ public final class Vm {
 	private VmThread nextRunnable() {
 		long now = System.currentTimeMillis();
 		synchronized (threads) {
-			for (VmThread t : threads) {
-				if (t.state == VmThread.RUNNABLE && !t.frames.isEmpty())
-					return t;
-				if (t.state == VmThread.TIMED_WAITING && now >= t.wakeTime)
-					return t; // Interpreter will retry its op (state restored inside)
+			int n = threads.size();
+			for (int k = 0; k < n; k++) {
+				int idx = (rrCursor + k) % n;
+				VmThread t = threads.get(idx);
+				if (t.state == VmThread.RUNNABLE && !t.frames.isEmpty()
+						|| t.state == VmThread.TIMED_WAITING && now >= t.wakeTime) {
+					// resume scanning after this thread so every runnable thread gets slices
+					rrCursor = (idx + 1) % n;
+					return t; // TIMED_WAITING: Interpreter will retry its op (state restored inside)
+				}
 			}
 		}
 		return null;
@@ -539,22 +798,26 @@ public final class Vm {
 	 * TERMINATED by a nested run (e.g. a blocking clinit); revive it so the
 	 * scheduler picks it up again.
 	 */
-	/** Take a pooled frame whose arrays fit, or allocate. Caller sets flags. */
+	/** Take a pooled frame of exactly this method's array sizes, or allocate. */
 	Frame allocFrame(VmClass owner, ClassFile.Method m) {
-		int needL = m.code.maxLocals, needS = m.code.maxStack + 1;
-		for (Frame f : framePool)
-			if (f.locals.length >= needL && f.stack.length >= needS) {
-				framePool.remove(f);
-				f.reset(owner, m);
-				return f;
-			}
+		int key = (m.code.maxLocals << 16) | (m.code.maxStack + 1);
+		java.util.ArrayDeque<Frame> q = framePools.get(key);
+		Frame f = q == null ? null : q.poll();
+		if (f != null) {
+			f.reset(owner, m);
+			return f;
+		}
 		return new Frame(owner, m);
 	}
 
-	/** Return a dead frame to the pool (small bound — pools only need hot sizes). */
+	/** Return a dead frame to its size bucket (bounded — pools only need hot sizes). */
 	void freeFrame(Frame f) {
-		if (framePool.size() < 128)
-			framePool.add(f);
+		int key = (f.locals.length << 16) | f.stack.length;
+		java.util.ArrayDeque<Frame> q = framePools.get(key);
+		if (q == null)
+			framePools.put(key, q = new java.util.ArrayDeque<Frame>());
+		if (q.size() < 64)
+			q.add(f);
 	}
 
 	private static void pushFrame(VmThread t, Frame f) {
@@ -573,6 +836,9 @@ public final class Vm {
 					? owner.declaredMethods.get(name + "|" + desc)
 					: owner.findMethod(name, desc);
 			if (m == null) {
+				if (Interpreter.TRACE_CALLS != null)
+					System.err.println("pushInvoke host-fallback " + recv
+							+ "." + name + desc + " owner=" + owner.name);
 				VmClass hb = owner.hostBoundary();
 				Object r = bridge.call(t, hb != null ? hb.name : "java/lang/Object",
 						name, desc, args, 0);
@@ -619,7 +885,7 @@ public final class Vm {
 			if (c == 'L')
 				i = desc.indexOf(';', i);
 			Object v = args[ai++];
-			f.locals[li++] = fromHost(v);
+			f.locals[li++] = c == 'L' ? fromHost(v, false) : fromHost(v);
 			if (c == 'J' || c == 'D')
 				f.locals[li++] = Frame.WIDE;
 		}
@@ -791,8 +1057,20 @@ public final class Vm {
 
 	/** host -> guest: unwrap shadows; normalize int-family primitives to Integer. */
 	static Object fromHost(Object v) {
+		return fromHost(v, true);
+	}
+
+	/**
+	 * host -> guest into a slot of known static type. Shadows always unwrap;
+	 * int-family wrappers normalize to Integer only for primitive slots —
+	 * reference-typed slots keep the real object so checkcast/instanceof on
+	 * java/lang/Short & friends see real semantics.
+	 */
+	static Object fromHost(Object v, boolean primitiveSlot) {
 		if (v instanceof GuestShadow)
 			return ((GuestShadow) v).guest();
+		if (!primitiveSlot)
+			return v;
 		if (v instanceof Boolean)
 			return (Boolean) v ? 1 : 0;
 		if (v instanceof Character)
@@ -828,6 +1106,8 @@ public final class Vm {
 				target = greenTargets.get(key);
 			}
 		}
+		if (Interpreter.TRACE_CALLS != null)
+			System.err.println("startGreen key=" + key + " target=" + target);
 		if (target == null)
 			return; // Thread with no runnable target: start() is a no-op
 		VmThread nt = newThread();

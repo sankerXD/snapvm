@@ -47,7 +47,7 @@ final class ClassFile {
 	static final class Ref {
 		int tag; // 9 field, 10 method, 11 iface method
 		String owner, name, desc;
-		private int argSlots = -1, argCount = -1, retKind = -1;
+		private int argSlots = -1, argCount = -1, retKind = -1, retRef = -1;
 		String key;          // name|desc — methodMap/declaredMethods lookup key
 		// resolved caches — classes never unload, so bindings stay valid
 		VmClass ownerClass;
@@ -57,6 +57,7 @@ final class ClassFile {
 		VmClass cacheRecv;               // monomorphic inline cache for virtuals
 		ClassFile.Method cacheMethod;
 		VmClass cacheDecl;
+		Vm.FastCall cacheFast;           // registered host fast-path for the resolved guest method, if any
 
 		int argSlots() {
 			if (argSlots < 0)
@@ -77,6 +78,16 @@ final class ClassFile {
 				retKind = rt.equals("V") ? 0 : VmClass.isWide(rt) ? 2 : 1;
 			}
 			return retKind;
+		}
+
+		/** true if the return type is a reference type. */
+		boolean retRef() {
+			if (retRef < 0) {
+				String rt = VmClass.returnType(desc);
+				char c = rt.isEmpty() ? 'V' : rt.charAt(0);
+				retRef = (c == 'L' || c == '[') ? 1 : 0;
+			}
+			return retRef == 1;
 		}
 
 		String key() {

@@ -311,6 +311,8 @@ public final class Interpreter {
 			r.cacheRecv = rc;
 			r.cacheMethod = m;
 			r.cacheDecl = decl;
+			r.cacheFast = m == null ? null
+					: vm.fastCall(decl.name, m.name, m.desc);
 		}
 		if (m != null && m.code == null)
 			throw new VmException(new AbstractMethodError(rc.name + "." + r.name));
@@ -320,6 +322,34 @@ public final class Interpreter {
 			Object[] args = popToArray(f, r, true);
 			Object ret = vm.bridge.call(t, hb != null ? hb.name : "java/lang/Object",
 					r.name, r.desc, args, 0);
+			f.pc = pc + oplen;
+			pushRet(f, r, ret);
+			return;
+		}
+		if (r.cacheFast != null) {
+			// host fast-path for a resolved guest method (registered per
+			// declaring-class key — guest overrides resolve to their own
+			// decl and bypass this). Monitor semantics identical to running
+			// the frame: acquire before args are consumed so a failed
+			// monEnter can retry the whole invoke on wake.
+			Object fastSync = null;
+			if ((m.access & 0x0020) != 0) { // ACC_SYNCHRONIZED: lock the receiver
+				fastSync = recv;
+				if (!vm.monEnter(t, fastSync))
+					return; // park; the whole invoke retries on wake
+			}
+			Object[] args = popToArray(f, r, true);
+			Object ret;
+			try {
+				ret = Vm.fromHost(r.cacheFast.invoke(args), !r.retRef());
+			} catch (VmError | VmException e) {
+				throw e;
+			} catch (Exception e) {
+				throw new VmException(e);
+			} finally {
+				if (fastSync != null)
+					vm.monExit(t, fastSync);
+			}
 			f.pc = pc + oplen;
 			pushRet(f, r, ret);
 			return;
@@ -352,13 +382,23 @@ public final class Interpreter {
 	private static void pushGuestFrame(VmThread t, Frame caller, VmClass decl,
 			ClassFile.Method m, ClassFile.Ref r, int pc, int oplen, boolean hasThis,
 			Object syncOn) {
-		Object[] args = popToArray(caller, r, hasThis);
+		// arg slot layout is identical on the stack and in locals
+		// (wide args are value+WIDE in both) — copy the slice directly
+		int slots = r.argSlots() + (hasThis ? 1 : 0);
+		caller.sp -= slots;
 		caller.pc = pc + oplen;
 		caller.callPc = pc;
 		Frame nf = t.vm.allocFrame(decl, m);
 		nf.fromCall = true;
 		nf.syncOn = syncOn;
-		Vm.fillArgs(nf, r.desc, args, hasThis);
+		System.arraycopy(caller.stack, caller.sp, nf.locals, 0, slots);
+		for (int i = 0; i < slots; i++) {
+			Object v = nf.locals[i];
+			// unwrap only shadows — real int-family wrappers are legitimate
+			// values in reference-typed arg slots since fromHost keeps them
+			if (v instanceof GuestShadow)
+				nf.locals[i] = Vm.fromHost(v);
+		}
 		t.frames.add(nf);
 	}
 
@@ -558,6 +598,7 @@ public final class Interpreter {
 					f.owner.name + "." + f.method.name, pc, op, sp,
 					java.util.Arrays.toString(java.util.Arrays.copyOf(st, Math.min(sp, 8))));
 
+		boolean frameChanged = false;
 		switch (op) {
 			// const
 			case 0x00: pc++; continue;
@@ -594,19 +635,63 @@ public final class Interpreter {
 				st[sp++] = lo[op - 0x26]; st[sp++] = Frame.WIDE; break;
 			case 0x2a: case 0x2b: case 0x2c: case 0x2d:
 				st[sp++] = lo[op - 0x2a]; break;
-			// array loads
-			case 0x2e: case 0x30: case 0x32: case 0x33: case 0x34: case 0x35: {
+			// array loads — typed fast paths; reflective fallback keeps exotic cases
+			case 0x2e: { // iaload
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				// baload/caload/saload unwrap to Byte/Character/Short/Boolean;
-				// the guest stack convention is Integer
-				st[sp++] = Vm.fromHost(Array.get(arr, idx));
+				st[sp++] = arr instanceof int[] ? ((int[]) arr)[idx]
+						: Vm.fromHost(Array.get(arr, idx));
 				break;
 			}
-			case 0x2f: case 0x31: {
+			case 0x30: { // faload
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				st[sp++] = Array.get(arr, idx);
+				st[sp++] = arr instanceof float[] ? ((float[]) arr)[idx]
+						: Vm.fromHost(Array.get(arr, idx));
+				break;
+			}
+			case 0x32: { // aaload
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof Object[] ? ((Object[]) arr)[idx]
+						: Vm.fromHost(Array.get(arr, idx));
+				break;
+			}
+			case 0x33: { // baload — byte[] or boolean[], stack convention is Integer
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof byte[] ? (int) ((byte[]) arr)[idx]
+						: arr instanceof boolean[] ? (((boolean[]) arr)[idx] ? 1 : 0)
+						: Vm.fromHost(Array.get(arr, idx));
+				break;
+			}
+			case 0x34: { // caload
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof char[] ? (int) ((char[]) arr)[idx]
+						: Vm.fromHost(Array.get(arr, idx));
+				break;
+			}
+			case 0x35: { // saload
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof short[] ? (int) ((short[]) arr)[idx]
+						: Vm.fromHost(Array.get(arr, idx));
+				break;
+			}
+			case 0x2f: { // laload
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof long[] ? ((long[]) arr)[idx]
+						: Array.get(arr, idx);
+				st[sp++] = Frame.WIDE;
+				break;
+			}
+			case 0x31: { // daload
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				st[sp++] = arr instanceof double[] ? ((double[]) arr)[idx]
+						: Array.get(arr, idx);
 				st[sp++] = Frame.WIDE;
 				break;
 			}
@@ -640,27 +725,89 @@ public final class Interpreter {
 			}
 			case 0x4b: case 0x4c: case 0x4d: case 0x4e:
 				lo[op - 0x4b] = st[--sp]; break;
-			// array stores
-			case 0x4f: case 0x51: case 0x54: case 0x55: case 0x56: {
+			// array stores — typed fast paths, narrowing/reflective fallback preserved
+			case 0x4f: { // iastore
 				Object v = st[--sp];
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				storeArray(arr, idx, v);
+				if (arr instanceof int[] && v instanceof Integer)
+					((int[]) arr)[idx] = (Integer) v;
+				else
+					storeArray(arr, idx, v);
 				break;
 			}
-			case 0x50: case 0x52: {
+			case 0x51: { // fastore
+				Object v = st[--sp];
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				if (arr instanceof float[] && v instanceof Float)
+					((float[]) arr)[idx] = (Float) v;
+				else
+					storeArray(arr, idx, v);
+				break;
+			}
+			case 0x54: { // bastore — byte[] or boolean[]
+				Object v = st[--sp];
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				if (arr instanceof byte[] && v instanceof Integer)
+					((byte[]) arr)[idx] = (byte) (int) (Integer) v;
+				else if (arr instanceof boolean[] && v instanceof Integer)
+					((boolean[]) arr)[idx] = ((Integer) v & 1) != 0;
+				else
+					storeArray(arr, idx, v);
+				break;
+			}
+			case 0x55: { // castore
+				Object v = st[--sp];
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				if (arr instanceof char[] && v instanceof Integer)
+					((char[]) arr)[idx] = (char) (int) (Integer) v;
+				else
+					storeArray(arr, idx, v);
+				break;
+			}
+			case 0x56: { // sastore
+				Object v = st[--sp];
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				if (arr instanceof short[] && v instanceof Integer)
+					((short[]) arr)[idx] = (short) (int) (Integer) v;
+				else
+					storeArray(arr, idx, v);
+				break;
+			}
+			case 0x50: { // lastore
 				Object v = st[sp - 2];
 				sp -= 2;
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				storeArray(arr, idx, v);
+				if (arr instanceof long[] && v instanceof Long)
+					((long[]) arr)[idx] = (Long) v;
+				else
+					storeArray(arr, idx, v);
+				break;
+			}
+			case 0x52: { // dastore
+				Object v = st[sp - 2];
+				sp -= 2;
+				int idx = (Integer) st[--sp];
+				Object arr = st[--sp];
+				if (arr instanceof double[] && v instanceof Double)
+					((double[]) arr)[idx] = (Double) v;
+				else
+					storeArray(arr, idx, v);
 				break;
 			}
 			case 0x53: { // aastore — the only store needing a covariance check
 				Object v = st[--sp];
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				storeArrayChecked(vm, arr, idx, v);
+				if (arr.getClass() == Object[].class && vm.guestArrayTypes.get(arr) == null)
+					((Object[]) arr)[idx] = v; // plain Object[]: no constraint
+				else
+					storeArrayChecked(vm, arr, idx, v);
 				break;
 			}
 			// stack ops
@@ -672,16 +819,7 @@ public final class Interpreter {
 				st[sp - 2] = b; st[sp - 1] = a; st[sp++] = b;
 				break;
 			}
-			case 0x5b: {                                             // dup_x2
-				if (st[sp - 2] == Frame.WIDE) {
-					Object b = st[sp - 1], v = st[sp - 3];
-					st[sp - 3] = b; st[sp - 2] = v; st[sp - 1] = Frame.WIDE; st[sp++] = b;
-				} else {
-					Object c = st[sp - 1], b = st[sp - 2], a = st[sp - 3];
-					st[sp - 3] = c; st[sp - 2] = a; st[sp - 1] = b; st[sp++] = c;
-				}
-				break;
-			}
+			case 0x5b: sp = dupX2(st, sp); break;                     // dup_x2
 			case 0x5c:                                               // dup2
 				if (st[sp - 1] == Frame.WIDE) {
 					st[sp] = st[sp - 2]; st[sp + 1] = Frame.WIDE; sp += 2;
@@ -689,44 +827,8 @@ public final class Interpreter {
 					st[sp] = st[sp - 2]; st[sp + 1] = st[sp - 1]; sp += 2;
 				}
 				break;
-			case 0x5d: {                                             // dup2_x1
-				if (st[sp - 1] == Frame.WIDE) { // wide over single
-					Object v = st[sp - 2], a = st[sp - 3];
-					st[sp - 3] = v; st[sp - 2] = Frame.WIDE; st[sp - 1] = a;
-					st[sp] = v; st[sp + 1] = Frame.WIDE; sp += 2;
-				} else {
-					Object c = st[sp - 1], b = st[sp - 2], a = st[sp - 3];
-					st[sp - 3] = b; st[sp - 2] = c; st[sp - 1] = a;
-					st[sp] = b; st[sp + 1] = c; sp += 2;
-				}
-				break;
-			}
-			case 0x5e: {                                             // dup2_x2
-				if (st[sp - 1] == Frame.WIDE) {
-					if (st[sp - 3] == Frame.WIDE) { // wide over wide
-						Object v2 = st[sp - 2], v1 = st[sp - 4];
-						st[sp - 4] = v2; st[sp - 3] = Frame.WIDE;
-						st[sp - 2] = v1; st[sp - 1] = Frame.WIDE;
-						st[sp] = v2; st[sp + 1] = Frame.WIDE; sp += 2;
-					} else { // wide over two singles
-						Object v = st[sp - 2], b = st[sp - 3], a = st[sp - 4];
-						st[sp - 4] = v; st[sp - 3] = Frame.WIDE;
-						st[sp - 2] = a; st[sp - 1] = b;
-						st[sp] = v; st[sp + 1] = Frame.WIDE; sp += 2;
-					}
-				} else if (st[sp - 3] == Frame.WIDE) { // two singles over wide
-					// [.., w, WIDE, a, b] -> [.., a, b, w, WIDE, a, b]
-					Object b = st[sp - 1], a = st[sp - 2], w = st[sp - 4];
-					st[sp - 4] = a; st[sp - 3] = b;
-					st[sp - 2] = w; st[sp - 1] = Frame.WIDE;
-					st[sp] = a; st[sp + 1] = b; sp += 2;
-				} else { // two singles over two singles
-					Object d = st[sp - 1], c = st[sp - 2], b = st[sp - 3], a = st[sp - 4];
-					st[sp - 4] = c; st[sp - 3] = d; st[sp - 2] = a; st[sp - 1] = b;
-					st[sp] = c; st[sp + 1] = d; sp += 2;
-				}
-				break;
-			}
+			case 0x5d: sp = dup2X1(st, sp); break;                    // dup2_x1
+			case 0x5e: sp = dup2X2(st, sp); break;                    // dup2_x2
 			case 0x5f: {                                             // swap
 				Object a = st[sp - 1];
 				st[sp - 1] = st[sp - 2]; st[sp - 2] = a;
@@ -829,156 +931,52 @@ public final class Interpreter {
 			case 0xa7: pc += s2(code, pc + 1); continue;
 			case 0xa8: case 0xa9:                                      // jsr/ret
 				throw new VmError("jsr/ret not supported");
-			case 0xaa: { // tableswitch
-				int idx = (Integer) st[--sp];
-				int base = pc + 1 + ((4 - ((pc + 1) & 3)) & 3);
-				int def = s4(code, base);
-				int low = s4(code, base + 4), high = s4(code, base + 8);
-				int off = (idx >= low && idx <= high)
-						? s4(code, base + 12 + (idx - low) * 4) : def;
-				pc += off;
+			case 0xaa: // tableswitch
+				pc += tableSwitchOff(code, pc, (Integer) st[--sp]);
 				continue;
-			}
-			case 0xab: { // lookupswitch
-				int key = (Integer) st[--sp];
-				int base = pc + 1 + ((4 - ((pc + 1) & 3)) & 3);
-				int def = s4(code, base);
-				int npairs = s4(code, base + 4);
-				int off = def;
-				for (int i = 0; i < npairs; i++) {
-					if (s4(code, base + 8 + i * 8) == key) {
-						off = s4(code, base + 12 + i * 8);
-						break;
-					}
-				}
-				pc += off;
+			case 0xab: // lookupswitch
+				pc += lookupSwitchOff(code, pc, (Integer) st[--sp]);
 				continue;
-			}
 			// returns
-			case 0xac: case 0xae: case 0xb0: { // ireturn/freturn/areturn
-				f.sp = sp;
-				doReturnTyped(t, f);
-				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
-						|| (depth >= 0 && t.frames.size() <= depth))
-					return used;
-				f = t.top();
-				code = f.method.code.code;
-				cf = f.owner.cf;
-				st = f.stack; lo = f.locals;
-				sp = f.sp; pc = f.pc;
-				continue;
-			}
-			case 0xad: case 0xaf: { // lreturn/dreturn
-				f.sp = sp;
-				doReturnWide(t, f);
-				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
-						|| (depth >= 0 && t.frames.size() <= depth))
-					return used;
-				f = t.top();
-				code = f.method.code.code;
-				cf = f.owner.cf;
-				st = f.stack; lo = f.locals;
-				sp = f.sp; pc = f.pc;
-				continue;
-			}
-			case 0xb1: {
-				f.sp = sp;
-				doReturnVoid(t);
-				if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
-						|| (depth >= 0 && t.frames.size() <= depth))
-					return used;
-				f = t.top();
-				code = f.method.code.code;
-				cf = f.owner.cf;
-				st = f.stack; lo = f.locals;
-				sp = f.sp; pc = f.pc;
-				continue;
-			}
+			case 0xac: case 0xae: case 0xb0: // ireturn/freturn/areturn
+				f.sp = sp; doReturnTyped(t, f); frameChanged = true; break;
+			case 0xad: case 0xaf: // lreturn/dreturn
+				f.sp = sp; doReturnWide(t, f); frameChanged = true; break;
+			case 0xb1:
+				f.sp = sp; doReturnVoid(t); frameChanged = true; break;
 			// field access
-			case 0xb2: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false);
-			if (t.top() != f) return used; // clinit frame pushed; retry after it runs
-			pc = f.pc; sp = f.sp; continue;
-			case 0xb3: f.sp = sp; getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true);
-			if (t.top() != f) return used; // clinit frame pushed; retry after it runs
-			pc = f.pc; sp = f.sp; continue;
-			case 0xb4: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, false);
-			pc = f.pc; sp = f.sp; continue;
-			case 0xb5: f.sp = sp; getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, true);
-			pc = f.pc; sp = f.sp; continue;
+			case 0xb2: case 0xb3: {
+				f.sp = sp;
+				getPutStatic(vm, t, f, ref(cf, u2(code, pc + 1)), pc, op == 0xb3);
+				if (t.top() != f || t.state != VmThread.RUNNABLE) {
+					frameChanged = true; // clinit pushed or parked — reload
+					break;
+				}
+				pc = f.pc; sp = f.sp; continue;
+			}
+			case 0xb4: case 0xb5: {
+				f.sp = sp;
+				getPutField(vm, t, f, ref(cf, u2(code, pc + 1)), pc, op == 0xb5);
+				pc = f.pc; sp = f.sp; continue;
+			}
 			// invokes
-			case 0xb6: {
+			case 0xb6: case 0xb7: case 0xb8: case 0xb9: {
 				f.sp = sp;
-				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 0);
-				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
-					return used;
-				Frame nf = t.top();
-				if (nf != f) { // guest frame pushed — switch to it inline
-					f = nf;
-					code = f.method.code.code;
-					cf = f.owner.cf;
-					st = f.stack; lo = f.locals;
-					sp = f.sp; pc = f.pc;
-				} else { pc = f.pc; sp = f.sp; }
-				continue;
-			}
-			case 0xb7: {
-				f.sp = sp;
-				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 2);
-				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
-					return used;
-				Frame nf = t.top();
-				if (nf != f) { // guest frame pushed — switch to it inline
-					f = nf;
-					code = f.method.code.code;
-					cf = f.owner.cf;
-					st = f.stack; lo = f.locals;
-					sp = f.sp; pc = f.pc;
-				} else { pc = f.pc; sp = f.sp; }
-				continue;
-			}
-			case 0xb8: {
-				f.sp = sp;
-				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 3, 1);
-				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
-					return used;
-				Frame nf = t.top();
-				if (nf != f) { // guest frame pushed — switch to it inline
-					f = nf;
-					code = f.method.code.code;
-					cf = f.owner.cf;
-					st = f.stack; lo = f.locals;
-					sp = f.sp; pc = f.pc;
-				} else { pc = f.pc; sp = f.sp; }
-				continue;
-			}
-			case 0xb9: {
-				f.sp = sp;
-				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc, 5, 0);
-				if (t.state != VmThread.RUNNABLE || t.frames.isEmpty())
-					return used;
-				Frame nf = t.top();
-				if (nf != f) { // guest frame pushed — switch to it inline
-					f = nf;
-					code = f.method.code.code;
-					cf = f.owner.cf;
-					st = f.stack; lo = f.locals;
-					sp = f.sp; pc = f.pc;
-				} else { pc = f.pc; sp = f.sp; }
-				continue;
+				invoke(vm, t, f, ref(cf, u2(code, pc + 1)), pc,
+						op == 0xb9 ? 5 : 3,
+						op == 0xb7 ? 2 : op == 0xb8 ? 1 : 0);
+				frameChanged = true;
+				break;
 			}
 			case 0xba: throw new VmError("invokedynamic not supported");
 			// new/arrays
-			case 0xbb: { // new
-				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
-				if (c.host)
-					st[sp++] = new HostBridge.NewMarker(c);
-				else {
-					if (!vm.ensureInit(c, t)) { f.sp = sp; return used; }
-					st[sp++] = new VmObject(c);
+			case 0xbb:
+				f.sp = sp;
+				if (!newOp(vm, t, f, cf, u2(code, pc + 1), pc)) {
+					frameChanged = true; // clinit pushed or parked — reload
+					break;
 				}
-				pc += 3;
-				continue;
-			}
+				pc = f.pc; sp = f.sp; continue;
 			case 0xbc: { // newarray
 				int n = (Integer) st[--sp];
 				int at = code[pc + 1] & 0xff;
@@ -997,7 +995,16 @@ public final class Interpreter {
 				Object arr = st[--sp];
 				if (arr == null)
 					throw new VmException(new NullPointerException());
-				st[sp++] = Array.getLength(arr);
+				st[sp++] = arr instanceof Object[] ? ((Object[]) arr).length
+						: arr instanceof byte[] ? ((byte[]) arr).length
+						: arr instanceof int[] ? ((int[]) arr).length
+						: arr instanceof char[] ? ((char[]) arr).length
+						: arr instanceof short[] ? ((short[]) arr).length
+						: arr instanceof long[] ? ((long[]) arr).length
+						: arr instanceof float[] ? ((float[]) arr).length
+						: arr instanceof double[] ? ((double[]) arr).length
+						: arr instanceof boolean[] ? ((boolean[]) arr).length
+						: Array.getLength(arr);
 				break;
 			}
 			case 0xbf: { // athrow
@@ -1006,23 +1013,14 @@ public final class Interpreter {
 					ex = new NullPointerException();
 				throw new VmException(ex);
 			}
-			case 0xc0: { // checkcast
-				Object o = st[sp - 1];
-				if (o != null) {
-					VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
-					if (!c.isInstance(o))
-						throw new VmException(new ClassCastException(
-								o.getClass().getName() + " -> " + c.name));
-				}
-				pc += 3;
-				continue;
-			}
+			case 0xc0: // checkcast
+				checkCast(vm, cf, u2(code, pc + 1), st[sp - 1]);
+				pc += 3; continue;
 			case 0xc1: { // instanceof
-				Object o = st[--sp];
-				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
-				st[sp++] = o != null && c.isInstance(o) ? 1 : 0;
-				pc += 3;
-				continue;
+				Object o = st[sp - 1];
+				st[sp - 1] = o != null
+						&& vm.resolveClass(cf.className(u2(code, pc + 1))).isInstance(o) ? 1 : 0;
+				pc += 3; continue;
 			}
 			case 0xc2: { // monitorenter
 				Object o = st[sp - 1];
@@ -1042,40 +1040,10 @@ public final class Interpreter {
 				vm.monExit(t, o);
 				break;
 			}
-			case 0xc4: { // wide
-				int wop = code[pc + 1] & 0xff;
-				int n = u2(code, pc + 2);
-				if (wop == 0x84) {
-					lo[n] = (Integer) lo[n] + s2(code, pc + 4);
-					pc += 6;
-					continue;
-				}
-					// wide load/store
-					switch (wop) {
-						case 0x15: case 0x17: case 0x19:
-							st[sp++] = lo[n]; break;
-						case 0x16: case 0x18:
-							st[sp++] = lo[n]; st[sp++] = Frame.WIDE; break;
-						case 0x36: case 0x38: case 0x3a:
-							lo[n] = st[--sp]; break;
-						case 0x37: case 0x39:
-							lo[n + 1] = Frame.WIDE; lo[n] = st[sp - 2]; sp -= 2; break;
-						default:
-							throw new VmError("bad wide op " + wop);
-					}
-					pc += 4;
-					continue;
-				}
-			case 0xc5: { // multianewarray
-				int dims = code[pc + 3] & 0xff;
-				VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
-				int[] sizes = new int[dims];
-				for (int i = dims - 1; i >= 0; i--)
-					sizes[i] = (Integer) st[--sp];
-				st[sp++] = multiArray(vm, c.name, sizes, 0);
-				pc += 4;
-				continue;
-			}
+			case 0xc4: f.sp = sp; pc = wideOp(code, pc, st, lo, f);
+				sp = f.sp; continue; // wide
+			case 0xc5: f.sp = sp; multiNewArray(vm, cf, code, pc, f);
+				sp = f.sp; pc = f.pc; continue; // multianewarray
 			case 0xc6: { // ifnull
 				Object o = st[--sp];
 				pc = o == null ? pc + s2(code, pc + 1) : pc + 3;
@@ -1092,12 +1060,155 @@ public final class Interpreter {
 				throw new VmError("unimplemented opcode 0x" + Integer.toHexString(op)
 						+ " in " + f.describe());
 		}
+		if (frameChanged) {
+			// invoke pushed a frame / return popped / clinit pushed / parked —
+			// reload locals from the (possibly different) top frame inline
+			if (t.frames.isEmpty() || t.state != VmThread.RUNNABLE
+					|| (depth >= 0 && t.frames.size() <= depth))
+				return used;
+			f = t.top();
+			code = f.method.code.code;
+			cf = f.owner.cf;
+			st = f.stack; lo = f.locals;
+			sp = f.sp; pc = f.pc;
+			continue;
+		}
 		pc++; continue;
 		}
 	}
 
 	private static ClassFile.Ref ref(ClassFile cf, int idx) {
 		return (ClassFile.Ref) cf.cpValue(idx);
+	}
+
+	// ---------- cold-op helpers (extracted to keep step() under the 8K JIT limit) ----------
+
+	private static int dupX2(Object[] st, int sp) {
+		if (st[sp - 2] == Frame.WIDE) {
+			Object b = st[sp - 1], v = st[sp - 3];
+			st[sp - 3] = b; st[sp - 2] = v; st[sp - 1] = Frame.WIDE; st[sp++] = b;
+		} else {
+			Object c = st[sp - 1], b = st[sp - 2], a = st[sp - 3];
+			st[sp - 3] = c; st[sp - 2] = a; st[sp - 1] = b; st[sp++] = c;
+		}
+		return sp;
+	}
+
+	private static int dup2X1(Object[] st, int sp) {
+		if (st[sp - 1] == Frame.WIDE) { // wide over single
+			Object v = st[sp - 2], a = st[sp - 3];
+			st[sp - 3] = v; st[sp - 2] = Frame.WIDE; st[sp - 1] = a;
+			st[sp] = v; st[sp + 1] = Frame.WIDE; sp += 2;
+		} else {
+			Object c = st[sp - 1], b = st[sp - 2], a = st[sp - 3];
+			st[sp - 3] = b; st[sp - 2] = c; st[sp - 1] = a;
+			st[sp] = b; st[sp + 1] = c; sp += 2;
+		}
+		return sp;
+	}
+
+	private static int dup2X2(Object[] st, int sp) {
+		if (st[sp - 1] == Frame.WIDE) {
+			if (st[sp - 3] == Frame.WIDE) { // wide over wide
+				Object v2 = st[sp - 2], v1 = st[sp - 4];
+				st[sp - 4] = v2; st[sp - 3] = Frame.WIDE;
+				st[sp - 2] = v1; st[sp - 1] = Frame.WIDE;
+				st[sp] = v2; st[sp + 1] = Frame.WIDE; sp += 2;
+			} else { // wide over two singles
+				Object v = st[sp - 2], b = st[sp - 3], a = st[sp - 4];
+				st[sp - 4] = v; st[sp - 3] = Frame.WIDE;
+				st[sp - 2] = a; st[sp - 1] = b;
+				st[sp] = v; st[sp + 1] = Frame.WIDE; sp += 2;
+			}
+		} else if (st[sp - 3] == Frame.WIDE) { // two singles over wide
+			// [.., w, WIDE, a, b] -> [.., a, b, w, WIDE, a, b]
+			Object b = st[sp - 1], a = st[sp - 2], w = st[sp - 4];
+			st[sp - 4] = a; st[sp - 3] = b;
+			st[sp - 2] = w; st[sp - 1] = Frame.WIDE;
+			st[sp] = a; st[sp + 1] = b; sp += 2;
+		} else { // two singles over two singles
+			Object d = st[sp - 1], c = st[sp - 2], b = st[sp - 3], a = st[sp - 4];
+			st[sp - 4] = c; st[sp - 3] = d; st[sp - 2] = a; st[sp - 1] = b;
+			st[sp] = c; st[sp + 1] = d; sp += 2;
+		}
+		return sp;
+	}
+
+	private static int tableSwitchOff(byte[] code, int pc, int idx) {
+		int base = pc + 1 + ((4 - ((pc + 1) & 3)) & 3);
+		int def = s4(code, base);
+		int low = s4(code, base + 4), high = s4(code, base + 8);
+		return (idx >= low && idx <= high)
+				? s4(code, base + 12 + (idx - low) * 4) : def;
+	}
+
+	private static int lookupSwitchOff(byte[] code, int pc, int key) {
+		int base = pc + 1 + ((4 - ((pc + 1) & 3)) & 3);
+		int def = s4(code, base);
+		int npairs = s4(code, base + 4);
+		for (int i = 0; i < npairs; i++)
+			if (s4(code, base + 8 + i * 8) == key)
+				return s4(code, base + 12 + i * 8);
+		return def;
+	}
+
+	/** wide-prefixed op; reads/updates f.sp, returns the new pc. */
+	private static int wideOp(byte[] code, int pc, Object[] st, Object[] lo, Frame f) {
+		int wop = code[pc + 1] & 0xff;
+		int n = u2(code, pc + 2);
+		int sp = f.sp;
+		if (wop == 0x84) {
+			lo[n] = (Integer) lo[n] + s2(code, pc + 4);
+			return pc + 6;
+		}
+		switch (wop) { // wide load/store
+			case 0x15: case 0x17: case 0x19:
+				st[sp++] = lo[n]; break;
+			case 0x16: case 0x18:
+				st[sp++] = lo[n]; st[sp++] = Frame.WIDE; break;
+			case 0x36: case 0x38: case 0x3a:
+				lo[n] = st[--sp]; break;
+			case 0x37: case 0x39:
+				lo[n + 1] = Frame.WIDE; lo[n] = st[sp - 2]; sp -= 2; break;
+			default:
+				throw new VmError("bad wide op " + wop);
+		}
+		f.sp = sp;
+		return pc + 4;
+	}
+
+	private static void checkCast(Vm vm, ClassFile cf, int idx, Object o) {
+		if (o != null) {
+			VmClass c = vm.resolveClass(cf.className(idx));
+			if (!c.isInstance(o))
+				throw new VmException(new ClassCastException(
+						o.getClass().getName() + " -> " + c.name));
+		}
+	}
+
+	/** new: pushes the object (or NewMarker) and advances f.pc; false if a clinit
+	 *  frame was pushed or the thread parked — caller must reload. */
+	private static boolean newOp(Vm vm, VmThread t, Frame f, ClassFile cf, int idx, int pc) {
+		VmClass c = vm.resolveClass(cf.className(idx));
+		if (c.host) {
+			f.stack[f.sp++] = new HostBridge.NewMarker(c);
+		} else {
+			if (!vm.ensureInit(c, t))
+				return false; // clinit frame pushed / parked — retry this insn
+			f.stack[f.sp++] = new VmObject(c);
+		}
+		f.pc = pc + 3;
+		return true;
+	}
+
+	private static void multiNewArray(Vm vm, ClassFile cf, byte[] code, int pc, Frame f) {
+		int dims = code[pc + 3] & 0xff;
+		VmClass c = vm.resolveClass(cf.className(u2(code, pc + 1)));
+		int[] sizes = new int[dims];
+		for (int i = dims - 1; i >= 0; i--)
+			sizes[i] = (Integer) f.stack[--f.sp];
+		f.stack[f.sp++] = multiArray(vm, c.name, sizes, 0);
+		f.pc = pc + 4;
 	}
 
 	private static void doReturnTyped(VmThread t, Frame f) {

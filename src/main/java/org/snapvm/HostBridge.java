@@ -83,8 +83,9 @@ final class HostBridge {
 				new InvocationHandler() {
 					public Object invoke(Object proxy, Method method, Object[] args) {
 						Object[] in = args == null ? new Object[0] : args.clone();
+						Class<?>[] pts = method.getParameterTypes();
 						for (int i = 0; i < in.length; i++)
-							in[i] = Vm.fromHost(in[i]);
+							in[i] = Vm.fromHost(in[i], pts[i].isPrimitive());
 						Object r = vm.callFromHost(guest, method.getName(),
 								descOf(method), in);
 						return toHost(r, method.getReturnType());
@@ -271,7 +272,7 @@ final class HostBridge {
 			Method m = findMethod(hc, name, desc, kind == 1);
 			Object recv = kind == 1 ? null : toHost(args[0], hc);
 			Object[] margs = marshalArgs(m, args, kind == 1 ? 0 : 1);
-			return Vm.fromHost(m.invoke(recv, margs));
+			return Vm.fromHost(m.invoke(recv, margs), m.getReturnType().isPrimitive());
 		} catch (InvocationTargetException e) {
 			throw new VmException(e.getCause());
 		} catch (IllegalAccessException | InstantiationException | IllegalArgumentException e) {
@@ -1234,7 +1235,7 @@ final class HostBridge {
 	Object getStaticField(VmClass owner, ClassFile.Ref r) {
 		Field f = findField(owner.hostClass, r.name, r.desc, true);
 		try {
-			return Vm.fromHost(f.get(null));
+			return Vm.fromHost(f.get(null), f.getType().isPrimitive());
 		} catch (IllegalAccessException e) {
 			throw new VmError("getfield " + r.name, e);
 		}
@@ -1255,7 +1256,7 @@ final class HostBridge {
 			throw new VmException(new NoSuchFieldError(r.name + " (no host shadow)"));
 		Field f = findField(target.getClass(), r.name, r.desc, false);
 		try {
-			return Vm.fromHost(f.get(target));
+			return Vm.fromHost(f.get(target), f.getType().isPrimitive());
 		} catch (IllegalAccessException e) {
 			throw new VmError("getfield " + r.name, e);
 		}
