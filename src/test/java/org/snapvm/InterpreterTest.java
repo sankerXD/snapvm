@@ -820,6 +820,29 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		assertEquals(1, run(vm, "Si", "go"));
 	}
 
+	// Obfuscators hide super fields with same name+desc. The flattened
+	// fieldSlots map keeps only the child's index per key, so defaults built
+	// from that map left the hidden slot null — getfield of the never-written
+	// super int returned null and the first iadd unboxed it (host NPE inside
+	// step → guest NPE at the read site; 劲舞花儿朵朵 actors died every frame,
+	// stage rendered with no characters). The child's own field must still
+	// resolve to its own slot.
+	@Test
+	public void hiddenSuperFieldKeepsJvmDefault() throws Exception {
+		Vm vm = vm(compile(
+				"public class Sup {"
+						+ " private int a;"
+						+ " private int[] arr = new int[3];"
+						+ " public int go() { arr[2] += 4; a += arr[2]; return a; } }",
+				"public class Sub extends Sup {"
+						+ " public int a = 99;"
+						+ " public int[] arr = new int[5]; }",
+				"public class Hf { public static int go() {"
+						+ " Sub s = new Sub();"
+						+ " return s.go() * 100 + s.a; } }"));
+		assertEquals(499, run(vm, "Hf", "go"));
+	}
+
 	// Sup has a <clinit>, Sub has none. Constructing Sub must run Sup's
 	// <clinit> under Sup's own constant pool — not borrowed onto Sub.
 	@Test

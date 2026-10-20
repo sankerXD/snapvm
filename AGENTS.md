@@ -159,6 +159,21 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     its locals-scan must NOT re-normalize wrappers — arg slots can
     legitimately carry real `Short` objects now. Test:
     `boxedWrappersKeepIdentity`.
+- 劲舞花儿朵朵 bug (Oct 2025) — stage rendered, actors missing:
+  - **Hidden-field defaults lost**: obfuscated `j extends o` redeclares
+    `a:I`/`b:I`/`a:[[I` — same name+desc as `o`'s private fields. The
+    flat `fieldSlots` map is keyed `name|desc`, so the child's
+    `put(key, inst++)` overwrote the super's entry — and `fieldDefaults`
+    was built from that map's entrySet, so the hidden super slot never
+    got its JVM 0. `o.b` does `a += k` on never-written `o.a` →
+    `getfield` returned null → host unboxing NPE at `iadd` (guest NPE
+    at `o.b@241`), caught by the game and printed ×919 — the actor
+    update died before every render → empty stage. Fix: collect
+    per-slot defaults during slot assignment (declaration order ==
+    slot order), not from the deduplicated map afterwards. Lesson: any
+    field table keyed name|desc silently drops hidden declarations —
+    anything derived from it must iterate declarations, not the map.
+    Test: `hiddenSuperFieldKeepsJvmDefault`.
 - On-device diagnostic notes:
   - `System.err` goes to `/dev/null` on Android — all GuestCall/
     GuestThrow/uncaught output is invisible unless the adapter

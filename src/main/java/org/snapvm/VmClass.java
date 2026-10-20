@@ -223,6 +223,7 @@ public final class VmClass {
 		fieldSlots = new HashMap<>();
 		staticFieldSlots = new HashMap<>();
 		int inst = 0, stat = 0;
+		List<Object> defs = new ArrayList<>(); // per-SLOT defaults; a hidden field's map entry is overwritten but its slot still exists
 		for (VmClass c : chain) {
 			for (ClassFile.Field f : c.cf.fields) {
 				String key = f.name + "|" + f.desc;
@@ -234,8 +235,11 @@ public final class VmClass {
 					}
 				} else {
 					fieldSlots.put(key, inst++);
-					if (isWide(f.desc))
+					defs.add(defaultValue(key));
+					if (isWide(f.desc)) {
 						inst++;
+						defs.add(null);
+					}
 				}
 			}
 		}
@@ -247,9 +251,7 @@ public final class VmClass {
 				methodMap.put(m.name + "|" + m.desc, m);
 		}
 		instanceSlotCount = inst;
-		fieldDefaults = new Object[inst];
-		for (Map.Entry<String, Integer> e : fieldSlots.entrySet())
-			fieldDefaults[e.getValue()] = defaultValue(e.getKey());
+		fieldDefaults = defs.toArray(new Object[inst]);
 		statics = new Object[stat];
 		for (Map.Entry<String, Integer> e : staticFieldSlots.entrySet())
 			statics[e.getValue()] = defaultValue(e.getKey());
