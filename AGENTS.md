@@ -205,6 +205,33 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     `interruptWait`, `interruptJoin`, `joinTimeoutAndFlags`,
     `timedWaitAndInterruptFlags`, `threadOpsOnGuestThreadNoCrash`,
     `guestDeadlockThrowsVmError`.
+- M5a snapshot engine (Oct 2025) — `docs/snapshot-format.md` is the spec:
+  - `Vm.checkpoint()` freezes the whole machine under `execLock` (call
+    between pump slices); `Vm.restore(bytes)` wipes live state on any
+    same-configured Vm and repopulates. `Snapshot.java` does a
+    logical-value walk — guest values by tag, object graph through one
+    identity→id table, payload inline at first REF so cycles/interned
+    `==` survive.
+  - **Reader reserves the id slot (`PEND`) before reading a payload** —
+    a HANDLE record nests inside its parent's payload and its inner
+    objects take later ids; materializing parent-first breaks the
+    numbering. OBJ/ARR additionally set their slot early so self-cycles
+    resolve.
+  - Guest `new Object()` lands a real `java.lang.Object` in guest state
+    — `K_POBJ` treats it as an identity token (lock objects everywhere).
+    `java.util.Date`/`ByteArrayInputStream` ship built-in codecs
+    (`Vm.registerDefaultHandles`); anything else host-typed in guest
+    state needs `registerHostHandle` or the save throws `VmError`.
+  - `PARKED` threads can't serialize their done-callback — `callParked`
+    records `parkedCallKey`/`parkedArgs` on the thread and restore
+    **replays** the host call; the new done() wakes it.
+  - `ShadowCodec` (registered per host base, like ShadowFactory) folds
+    host-shadow state back on restore; a live hostShadow without a codec
+    refuses the save — silent corruption is worse than a loud refusal.
+    JL-Modern adapter codecs are the M5b half.
+  - Tests `SnapshotTest` ×7: round-trip worker (same-vm + fresh-vm),
+    heap identity/cycles/intern, wait-restore, sleep-delta, parked
+    replay, unhandled-host refusal, built-in handles.
 - On-device diagnostic notes:
   - `System.err` goes to `/dev/null` on Android — all GuestCall/
     GuestThrow/uncaught output is invisible unless the adapter

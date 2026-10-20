@@ -78,7 +78,7 @@ final class HostBridge {
 		return v;
 	}
 
-	private Object proxyFor(final VmObject guest, final Class<?> iface) {
+	Object proxyFor(final VmObject guest, final Class<?> iface) {
 		Object p = Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
 				new InvocationHandler() {
 					public Object invoke(Object proxy, Method method, Object[] args) {

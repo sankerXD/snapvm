@@ -41,9 +41,11 @@ public final class Vm {
 	final HostBridge bridge = new HostBridge(this);
 
 	private final List<ClassSource> sources = new ArrayList<>();
-	private final List<VmThread> threads = new ArrayList<>();
-	private int rrCursor; // round-robin scan start; a busy thread must not starve later ones
-	private final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
+	final List<VmThread> threads = new ArrayList<>();
+	int rrCursor; // round-robin scan start; a busy thread must not starve later ones
+	final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
+	final Map<Class<?>, HostHandle> hostHandles = new HashMap<>();
+	final Map<Class<?>, ShadowCodec> shadowCodecs = new HashMap<>();
 	private final Object lock = new Object();
 	private final Object execLock = new Object(); // serializes all guest execution
 	/** guest-visible thread key (host Thread or VmObject for guest-extends-Thread) -> green thread */
@@ -79,6 +81,39 @@ public final class Vm {
 			}
 		});
 		registerCldcFastCalls();
+		registerDefaultHandles();
+	}
+
+	/**
+	 * Built-in snapshot codecs for pure-JCL host objects that guest code
+	 * legitimately holds onto — Date keeps its epoch ms, a resource
+	 * ByteArrayInputStream keeps its remaining bytes (position resets, which
+	 * is observably identical for read-once streams).
+	 */
+	private void registerDefaultHandles() {
+		registerHostHandle(java.io.ByteArrayInputStream.class, new HostHandle() {
+			public Object capture(Vm vm, Object h) {
+				java.io.ByteArrayInputStream in = (java.io.ByteArrayInputStream) h;
+				byte[] b = new byte[in.available()];
+				in.mark(0);
+				in.read(b, 0, b.length);
+				in.reset();
+				return b;
+			}
+
+			public Object revive(Vm vm, Object rec) {
+				return new ByteArrayInputStream((byte[]) rec);
+			}
+		});
+		registerHostHandle(java.util.Date.class, new HostHandle() {
+			public Object capture(Vm vm, Object h) {
+				return ((java.util.Date) h).getTime();
+			}
+
+			public Object revive(Vm vm, Object rec) {
+				return new java.util.Date((Long) rec);
+			}
+		});
 	}
 
 	/**
@@ -1203,10 +1238,10 @@ public final class Vm {
 		void invoke(Vm vm, VmThread t, Object[] args, Runnable done);
 	}
 
-	private final Map<String, ParkedCall> parkedCalls = new HashMap<>();
+	final Map<String, ParkedCall> parkedCalls = new HashMap<>();
 	private final Map<String, ParkedCall> parkedCache = new HashMap<>();
 	private static final ParkedCall NONE = (v, t, a, d) -> { };
-	private static final Object PARKED = new Object();
+	static final Object PARKED = new Object();
 
 	/**
 	 * A host-call fast path: invokes directly without reflection/marshal.
@@ -1231,6 +1266,47 @@ public final class Vm {
 	/** key format: "javax/microedition/lcdui/Canvas.serviceRepaints()V" */
 	public void registerParkedCall(String methodKey, ParkedCall call) {
 		parkedCalls.put(methodKey, call);
+	}
+
+	// ---------- snapshots ----------
+
+	/**
+	 * Codec for host objects that leak into guest state (Bitmaps, streams...).
+	 * Lookup walks superclasses then interfaces. An unregistered host object
+	 * reachable from guest state aborts {@link #checkpoint} with a VmError.
+	 */
+	public void registerHostHandle(Class<?> type, HostHandle h) {
+		hostHandles.put(type, h);
+	}
+
+	/** State codec for shadows produced by a ShadowFactory, keyed by the same
+	 *  host base class. A guest object carrying a hostShadow with no registered
+	 *  codec aborts {@link #checkpoint} — restoring a fresh shadow while
+	 *  dropping its state would corrupt silently. */
+	public void registerShadowCodec(Class<?> hostBase, ShadowCodec c) {
+		shadowCodecs.put(hostBase, c);
+	}
+
+	/**
+	 * Freeze the whole guest machine to bytes under execLock — safe to call at
+	 * any scheduling boundary (between pump slices, on a UI action). Threads
+	 * mid host call (PARKED) are recorded for replay on restore.
+	 */
+	public byte[] checkpoint() {
+		synchronized (execLock) {
+			return Snapshot.write(this);
+		}
+	}
+
+	/**
+	 * Rebuild all guest state from a snapshot on a Vm constructed with the
+	 * same ClassSources/shadows/fastcalls/parkedCalls as the original. Works
+	 * on a fresh or a live Vm — existing state is discarded.
+	 */
+	public void restore(byte[] snap) {
+		synchronized (execLock) {
+			Snapshot.read(this, snap);
+		}
 	}
 
 	ParkedCall parkedCall(String ownerName, String name, String desc) {
@@ -1266,12 +1342,23 @@ public final class Vm {
 	Object callParked(VmThread t, ParkedCall pc, Object[] args) {
 		t.state = VmThread.WAITING;
 		t.waitMonitor = PARKED;
+		// record the call so a snapshot restore can replay it — the done closure
+		// itself is not serializable
+		for (Map.Entry<String, ParkedCall> e : parkedCalls.entrySet()) {
+			if (e.getValue() == pc) {
+				t.parkedCallKey = e.getKey();
+				break;
+			}
+		}
+		t.parkedArgs = args;
 		final boolean[] resumed = {false};
 		Runnable done = () -> {
 			synchronized (threads) {
 				if (resumed[0])
 					return;
 				resumed[0] = true;
+				t.parkedCallKey = null;
+				t.parkedArgs = null;
 				t.waitMonitor = null;
 				if (t.state == VmThread.WAITING)
 					t.state = VmThread.RUNNABLE;

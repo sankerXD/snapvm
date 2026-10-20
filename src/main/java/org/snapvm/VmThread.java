@@ -24,11 +24,13 @@ public final class VmThread {
 	boolean pendingInterrupt;   // deliver InterruptedException at interruptPc on resume
 	int interruptPc = -1;       // pc of the interruptible call (invoke site), for handler lookup
 	VmThread joinTarget;        // thread this one is join()-parked on (waitMonitor==null WAITING)
+	String parkedCallKey;       // registered ParkedCall key while waitMonitor==PARKED (snapshot replays it)
+	Object[] parkedArgs;        // guest args of the in-flight parked call
 	Object result;              // set when entry method returns
 	Object nestedResult;        // nested callFromHost result
 	VmException lastError;
 
-	private final List<VmThread> joinWaiters = new ArrayList<>();
+	final List<VmThread> joinWaiters = new ArrayList<>();
 
 	VmThread(Vm vm) {
 		this.vm = vm;

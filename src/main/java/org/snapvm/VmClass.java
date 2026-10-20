@@ -257,6 +257,21 @@ public final class VmClass {
 			statics[e.getValue()] = defaultValue(e.getKey());
 	}
 
+	/**
+	 * Drop runtime init state back to pre-init (snapshot restore). ConstantValue
+	 * statics re-apply on the next ensureInit; snapshot-restored classes get
+	 * their statics overwritten directly from the record.
+	 */
+	void resetRuntime() {
+		initDone = false;
+		initRunning = false;
+		initThread = null;
+		if (statics == null)
+			return;
+		for (Map.Entry<String, Integer> e : staticFieldSlots.entrySet())
+			statics[e.getValue()] = defaultValue(e.getKey());
+	}
+
 	/** JVM default value for a field type; desc arrives as "name|desc". */
 	private static Object defaultValue(String nameAndDesc) {
 		switch (nameAndDesc.charAt(nameAndDesc.lastIndexOf('|') + 1)) {
