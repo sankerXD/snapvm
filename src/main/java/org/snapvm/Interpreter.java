@@ -36,6 +36,21 @@ public final class Interpreter {
 			}
 			if (depth >= 0 && t.frames.size() <= depth)
 				break;
+			if (t.joinTarget != null) {
+				// back from join() — leave the target's waiter list so a later
+				// terminate() can't spuriously wake this thread mid-other-park
+				t.joinTarget.removeJoinWaiter(t);
+				t.joinTarget = null;
+			}
+			if (t.pendingInterrupt) {
+				t.pendingInterrupt = false;
+				t.interrupted = false; // delivering clears the interrupt status
+				if (t.interruptPc >= 0)
+					f.pc = t.interruptPc; // rewind to the interruptible call so catch ranges match
+				t.interruptPc = -1;
+				throwObject(vm, t, new InterruptedException());
+				continue;
+			}
 			try {
 				used += step(vm, t, f,
 						(int) Math.min(budget - used, Integer.MAX_VALUE), depth);

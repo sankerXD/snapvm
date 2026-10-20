@@ -20,6 +20,10 @@ public final class VmThread {
 	Object waitMonitor;         // monitor being waited on / contended
 	int waitReleasedCount;      // monitor count to restore after wait() returns
 	boolean resumingFromWait;   // retried monEnter before resuming after wait/notify
+	boolean interrupted;        // JVM interrupt status
+	boolean pendingInterrupt;   // deliver InterruptedException at interruptPc on resume
+	int interruptPc = -1;       // pc of the interruptible call (invoke site), for handler lookup
+	VmThread joinTarget;        // thread this one is join()-parked on (waitMonitor==null WAITING)
 	Object result;              // set when entry method returns
 	Object nestedResult;        // nested callFromHost result
 	VmException lastError;
@@ -52,6 +56,12 @@ public final class VmThread {
 	void addJoinWaiter(VmThread t) {
 		synchronized (joinWaiters) {
 			joinWaiters.add(t);
+		}
+	}
+
+	void removeJoinWaiter(VmThread t) {
+		synchronized (joinWaiters) {
+			joinWaiters.remove(t);
 		}
 	}
 

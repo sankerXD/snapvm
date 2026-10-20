@@ -501,11 +501,21 @@ final class HostBridge {
 		if (kind == 1 && name.equals("currentThread"))
 			return hostThread(t);
 		if (kind == 1 && name.equals("sleep")) {
+			if (t.interrupted) {
+				t.interrupted = false;
+				throw new VmException(new InterruptedException());
+			}
 			vm.greenSleep(t, (Long) args[0]);
 			return null;
 		}
 		if (kind == 1 && name.equals("yield"))
 			return null;
+		if (kind == 1 && name.equals("interrupted")) {
+			// static: current thread's status, cleared on read
+			boolean b = t.interrupted;
+			t.interrupted = false;
+			return b;
+		}
 		if (kind == 3) {
 			// real Thread object (fields/identity intact), but its Runnable guest target
 			// is recorded so start() can launch a green thread
@@ -536,8 +546,13 @@ final class HostBridge {
 				vm.startGreen(recv, t);
 				return null;
 			case "join": {
+				if (t.interrupted) {
+					t.interrupted = false;
+					throw new VmException(new InterruptedException());
+				}
 				VmThread target = vm.greenOf(recv);
 				if (target != null && target.isAlive()) {
+					t.joinTarget = target;
 					target.addJoinWaiter(t);
 					vm.park(t, desc.equals("(J)V") ? (Long) args[1] : 0);
 				}
@@ -548,7 +563,25 @@ final class HostBridge {
 				return target != null && target.isAlive();
 			}
 			case "interrupt":
+				vm.interruptGreen(vm.greenOf(recv));
 				return null;
+			case "isInterrupted": {
+				VmThread target = vm.greenOf(recv);
+				return target != null && target.interrupted;
+			}
+			// A guest `class X extends Thread` stays a VmObject with no host
+			// Thread to reflect on — no-op the mutators rather than marshal-
+			// crashing; the cooperative scheduler ignores priority anyway.
+			case "setPriority":
+			case "setDaemon":
+			case "setName":
+				return recv instanceof VmObject ? null : BuiltinMarker.NOT_HANDLED;
+			case "getPriority":
+				return recv instanceof VmObject ? 5 : BuiltinMarker.NOT_HANDLED;
+			case "getName":
+				return recv instanceof VmObject ? recv.toString() : BuiltinMarker.NOT_HANDLED;
+			case "isDaemon":
+				return recv instanceof VmObject ? false : BuiltinMarker.NOT_HANDLED;
 		}
 		return BuiltinMarker.NOT_HANDLED;
 	}

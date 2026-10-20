@@ -174,6 +174,37 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     field table keyed name|desc silently drops hidden declarations —
     anything derived from it must iterate declarations, not the map.
     Test: `hiddenSuperFieldKeepsJvmDefault`.
+- M4 thread semantics (Oct 2025):
+  - **`Thread.interrupt` is real now**: `VmThread.interrupted` is the JVM
+    status flag; `pendingInterrupt` + `interruptPc` defer delivery.
+    `interruptGreen` sets the flag always, but only WAITING/TIMED_WAITING
+    threads in an *interruptible* park (sleep/wait/join) wake early —
+    BLOCKED (monitor contention), clinit-gated (`waitMonitor==VmClass`)
+    and host-callback (`waitMonitor==PARKED`) threads keep the flag for
+    their next interruptible call, matching the JVM. Waking removes the
+    thread from monitor wait-sets and join waiter lists before resume;
+    `execute` delivers the guest `InterruptedException` at `interruptPc`
+    (the recorded invoke site — required so catch ranges match) and
+    clears both flags. Pre-set flags also throw immediately at the next
+    sleep/wait/join entry, before parking. `interrupted()` (static)
+    reads+clears, `isInterrupted()` reads on the *target* green.
+  - **join bookkeeping**: `joinTarget` tracks which thread a join() is
+    parked on (join parks WAITING with `waitMonitor==null` — invisible
+    otherwise). Cleared on resume/interrupt so `terminate()` can't
+    spuriously wake a joiner long gone. Also silently fixes timed-join
+    leaving stale waiter entries.
+  - **Deadlock detection lives ONLY in `runUntilDone`**: when the entry
+    thread is parked, nothing else is runnable or timed, and no thread
+    is `PARKED` on a host callback, entry calls throw `VmError` instead
+    of hanging. NEVER put this in `pump()` — a live game idling on key
+    input is a legal state, not a deadlock. `guestDeadlocked()` treats
+    `waitMonitor==PARKED` as "host may still wake it" — keep that.
+  - `setPriority`/`setDaemon`/`setName` on a guest `extends Thread`
+    (VmObject, no host Thread) are no-ops returning defaults — a
+    scheduler hint, not worth marshaling. Tests: `interruptSleep`,
+    `interruptWait`, `interruptJoin`, `joinTimeoutAndFlags`,
+    `timedWaitAndInterruptFlags`, `threadOpsOnGuestThreadNoCrash`,
+    `guestDeadlockThrowsVmError`.
 - On-device diagnostic notes:
   - `System.err` goes to `/dev/null` on Android — all GuestCall/
     GuestThrow/uncaught output is invisible unless the adapter

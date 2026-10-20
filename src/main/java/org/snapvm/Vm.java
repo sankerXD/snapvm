@@ -620,10 +620,16 @@ public final class Vm {
 		synchronized (m) {
 			if (m.owner != t)
 				throw new VmException(new IllegalMonitorStateException("wait without monitor"));
+			if (t.interrupted) {
+				// interrupted before parking: flag clears, monitor stays held
+				t.interrupted = false;
+				throw new VmException(new InterruptedException());
+			}
 			int released = m.count;
 			m.owner = null;
 			m.count = 0;
 			m.waiters.add(t);
+			recordInterruptPc(t);
 			t.state = ms > 0 ? VmThread.TIMED_WAITING : VmThread.WAITING;
 			t.wakeTime = ms > 0 ? System.currentTimeMillis() + ms : 0;
 			t.waitMonitor = m;
@@ -724,6 +730,9 @@ public final class Vm {
 				if (!t.isAlive() || canRun(t))
 					continue;
 				if (pendingWork() < 0) {
+					if (guestDeadlocked())
+						throw new VmError("guest deadlock: no runnable, timed or host-parked thread\n"
+								+ dumpThreads());
 					abandonedRuns++; // diagnostics: host callback returned with guest frames still parked
 					return;
 				}
@@ -780,6 +789,24 @@ public final class Vm {
 			}
 		}
 		return best == Long.MAX_VALUE ? -1 : best;
+	}
+
+	/** True when no live thread can ever run again: nothing runnable or timed,
+	 *  and nothing parked on a host callback (PARKED — the host may still
+	 *  complete it and produce guest-side wakeups). */
+	private boolean guestDeadlocked() {
+		synchronized (threads) {
+			boolean any = false;
+			for (VmThread u : threads) {
+				if (!u.isAlive() || u.frames.isEmpty())
+					continue;
+				any = true;
+				if (u.state == VmThread.RUNNABLE || u.state == VmThread.TIMED_WAITING
+						|| u.waitMonitor == PARKED)
+					return false;
+			}
+			return any;
+		}
 	}
 
 	void pushStatic(VmThread t, VmClass c, String name, String desc, Object[] args) {
@@ -1011,10 +1038,48 @@ public final class Vm {
 	}
 
 	void greenSleep(VmThread t, long ms) {
+		if (t.interrupted) {
+			// interrupted before parking: flag clears, IE at the call site
+			t.interrupted = false;
+			throw new VmException(new InterruptedException());
+		}
 		sleepCalls++;
 		sleepMsTotal += ms;
+		recordInterruptPc(t);
 		t.state = VmThread.TIMED_WAITING;
 		t.wakeTime = System.currentTimeMillis() + ms;
+	}
+
+	/** Thread.interrupt() on a green thread: set the flag; if the thread is in
+	 *  an interruptible park (sleep/wait/join), wake it and mark the exception
+	 *  for delivery on resume. Monitor-contention BLOCKED, host-parked and
+	 *  clinit-gated threads only get the flag — matching JVM semantics. */
+	void interruptGreen(VmThread g) {
+		if (g == null || !g.isAlive())
+			return;
+		g.interrupted = true;
+		if (g.state != VmThread.WAITING && g.state != VmThread.TIMED_WAITING)
+			return;
+		Object wm = g.waitMonitor;
+		if (wm == PARKED || wm instanceof VmClass)
+			return; // host-callback park and the clinit gate are not interruptible
+		if (wm instanceof Monitor) {
+			Monitor m = (Monitor) wm;
+			synchronized (m) {
+				m.waiters.remove(g); // leave the wait set; reacquire() still applies
+			}
+		}
+		if (g.joinTarget != null) {
+			g.joinTarget.removeJoinWaiter(g);
+			g.joinTarget = null;
+		}
+		g.pendingInterrupt = true;
+		g.state = VmThread.RUNNABLE;
+	}
+
+	private static void recordInterruptPc(VmThread t) {
+		Frame f = t.top();
+		t.interruptPc = f != null ? f.pc : -1;
 	}
 
 	// ---------- host-shadow support (guest class extends host class) ----------
@@ -1081,9 +1146,14 @@ public final class Vm {
 	}
 
 	void park(VmThread t, long ms) {
+		if (t.interrupted) {
+			t.interrupted = false;
+			throw new VmException(new InterruptedException());
+		}
 		if (ms > 0) {
 			greenSleep(t, ms);
 		} else {
+			recordInterruptPc(t);
 			t.state = VmThread.WAITING;
 		}
 	}

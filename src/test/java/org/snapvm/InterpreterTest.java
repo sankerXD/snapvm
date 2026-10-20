@@ -600,6 +600,148 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		assertEquals(5, run(vm, "Ts", "go"));
 	}
 
+	// interrupt() on a sleeping green thread wakes it and throws
+	// InterruptedException AT the sleep call site — the catch range around
+	// the invoke must match, so the throw rewinds to interruptPc.
+	@Test
+	public void interruptSleep() throws Exception {
+		Vm vm = vm(compile(
+				"public class Is {"
+						+ " static int r;"
+						+ " public static class S implements Runnable { public void run() {"
+						+ "  try { Thread.sleep(60000); r = 1; }"
+						+ "  catch (InterruptedException e) { r = 7; } } }"
+						+ " public static int go() {"
+						+ "  Thread s = new Thread(new S()); s.start();"
+						+ "  try { s.join(50); s.interrupt(); s.join(); }"
+						+ "  catch (InterruptedException e) { return -1; }"
+						+ "  return r; } }"));
+		assertEquals(7, run(vm, "Is", "go"));
+	}
+
+	// interrupt() during wait(): leaves the wait set, reacquires the monitor,
+	// then delivers InterruptedException — the catch must hold the lock again.
+	@Test
+	public void interruptWait() throws Exception {
+		Vm vm = vm(compile(
+				"public class Iw {"
+						+ " static final Object LOCK = new Object();"
+						+ " static int r;"
+						+ " public static class W implements Runnable { public void run() {"
+						+ "  synchronized (LOCK) {"
+						+ "   try { LOCK.wait(); r = 1; }"
+						+ "   catch (InterruptedException e) { r = 9; } } } }"
+						+ " public static int go() {"
+						+ "  Thread s = new Thread(new W()); s.start();"
+						+ "  try { s.join(50); s.interrupt(); s.join(); }"
+						+ "  catch (InterruptedException e) { return -1; }"
+						+ "  return r; } }"));
+		assertEquals(9, run(vm, "Iw", "go"));
+	}
+
+	// interrupt() during a plain join(): the joiner wakes with
+	// InterruptedException and leaves the target's waiter list.
+	@Test
+	public void interruptJoin() throws Exception {
+		Vm vm = vm(compile(
+				"public class Ij {"
+						+ " static int r;"
+						+ " public static class Sleeper implements Runnable { public void run() {"
+						+ "  try { Thread.sleep(60000); } catch (InterruptedException e) {} } }"
+						+ " public static class Joiner implements Runnable { public void run() {"
+						+ "  Thread t = new Thread(new Sleeper()); t.start();"
+						+ "  try { t.join(); r = 1; } catch (InterruptedException e) { r = 5; } } }"
+						+ " public static int go() {"
+						+ "  Thread s = new Thread(new Joiner()); s.start();"
+						+ "  try { s.join(50); s.interrupt(); s.join(); }"
+						+ "  catch (InterruptedException e) { return -1; }"
+						+ "  return r; } }"));
+		assertEquals(5, run(vm, "Ij", "go"));
+	}
+
+	// join(ms) wakes on timeout while the target is still alive, then a
+	// plain join() still blocks to termination. Also covers a flag-set
+	// interrupted status surviving through isInterrupted/interrupted().
+	@Test
+	public void joinTimeoutAndFlags() throws Exception {
+		Vm vm = vm(compile(
+				"public class Jt {"
+						+ " static int r;"
+						+ " static Thread s;"
+						+ " public static class S implements Runnable { public void run() {"
+						+ "  try { Thread.sleep(200); } catch (InterruptedException e) {}"
+						+ "  r += 1; } }"
+						+ " public static int go() {"
+						+ "  r = 0;"
+						+ "  s = new Thread(new S()); s.start();"
+						+ "  try { s.join(50); } catch (InterruptedException e) { return -1; }"
+						+ "  int alive = s.isAlive() ? 1 : 0;"
+						+ "  try { s.join(); } catch (InterruptedException e) { return -2; }"
+						+ "  return alive * 10 + r + (s.isAlive() ? 100 : 0); } }"));
+		assertEquals(11, run(vm, "Jt", "go"));
+	}
+
+	// wait(ms) resumes by timer alone; isInterrupted/interrupted flag queries.
+	@Test
+	public void timedWaitAndInterruptFlags() throws Exception {
+		Vm vm = vm(compile(
+				"public class Tw {"
+						+ " static Thread s; static int r;"
+						+ " public static class Q implements Runnable { public void run() {"
+						+ "  Object o = new Object();"
+						+ "  try { synchronized (o) { o.wait(40); } }"
+						+ "  catch (InterruptedException e) { r = -1; return; }"
+						+ "  int a = s.isInterrupted() ? 1 : 0;"
+						+ "  s.interrupt();" // self-interrupt while runnable: flag only
+						+ "  int b = s.isInterrupted() ? 1 : 0;"
+						+ "  int c = Thread.interrupted() ? 1 : 0;" // reads+ clears
+						+ "  int d = Thread.interrupted() ? 1 : 0;"
+						+ "  r = a * 1000 + b * 100 + c * 10 + d; } }"
+						+ " public static int go() {"
+						+ "  s = new Thread(new Q()); s.start();"
+						+ "  try { s.join(); } catch (InterruptedException e) { return -1; }"
+						+ "  return r; } }"));
+		assertEquals(110, run(vm, "Tw", "go"));
+	}
+
+	// A guest class extending Thread has no host Thread object — Thread state
+	// mutators must not marshal-crash; scheduler ignores priority anyway.
+	@Test
+	public void threadOpsOnGuestThreadNoCrash() throws Exception {
+		Vm vm = vm(compile(
+				"public class Pt extends Thread {"
+						+ " static int ran;"
+						+ " public void run() { ran = 1; } }",
+				"public class Pm { public static int go() {"
+						+ "  Pt t = new Pt();"
+						+ "  t.setPriority(8); t.setDaemon(true); t.setName(\"w\");"
+						+ "  int p = t.getPriority();"
+						+ "  String n = t.getName();"
+						+ "  boolean d = t.isDaemon();"
+						+ "  t.start();"
+						+ "  try { t.join(); } catch (InterruptedException e) { return -1; }"
+						+ "  return p * 100 + (n != null ? 10 : 0) + (d ? 1 : 0) + Pt.ran * 1000; } }"));
+		assertEquals(1510, run(vm, "Pm", "go")); // 5*100+10+0+1000
+	}
+
+	// A guest thread waiting forever with no runnable/timed/host-parked
+	// thread can never wake — entry-point calls must surface that, not hang.
+	@Test
+	public void guestDeadlockThrowsVmError() throws Exception {
+		Vm vm = vm(compile(
+				"public class Dl { public static int go() {"
+						+ " Object o = new Object();"
+						+ " synchronized (o) { try { o.wait(); }"
+						+ "  catch (InterruptedException e) {} }"
+						+ " return 1; } }"));
+		try {
+			run(vm, "Dl", "go");
+			fail("expected VmError");
+		} catch (VmError e) {
+			assertTrue(e.getMessage().contains("deadlock"));
+		}
+	}
+
 	/** Multi-dim arrays keep real runtime types; guest arrays track component type. */
 	@Test
 	public void multiArrays() throws Exception {
