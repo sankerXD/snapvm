@@ -16,6 +16,9 @@ committing. A compile-only change is not acceptable.
 ## Build
 
 JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
+Gradle 8.7's Kotlin DSL cannot parse newer JDK version strings — if
+`./gradlew` dies with `IllegalArgumentException: <version>` from
+`JavaVersion.parse`, pin `JAVA_HOME` to the Temurin 17 install.
 
 ```bash
 ./gradlew test
@@ -199,6 +202,18 @@ JDK 17+ required for Gradle; sources are Java 8–compatible and Android-safe.
     of hanging. NEVER put this in `pump()` — a live game idling on key
     input is a legal state, not a deadlock. `guestDeadlocked()` treats
     `waitMonitor==PARKED` as "host may still wake it" — keep that.
+  - **Entry calls parked on a host callback must WAIT for done()** —
+    傲剑江湖-秘籍血案 white screen (Oct 2025): `iApp.<init>` parked in
+    `serviceRepaints` mid-construction, `pendingWork()` doesn't count
+    PARKED threads, so `runUntilDone` took the abandon path and
+    returned — `newGuestObject` completed with the constructor
+    unfinished, `putstatic mg` hadn't run, `startApp` read `mg==null`
+    → `setCurrent(null)` no-op → view never attached → every paint
+    dropped on `!visible`. Now `t.waitMonitor==PARKED` skips the
+    abandon/deadlock branch and keeps looping until done() fires —
+    an entry call returning mid-method silently corrupts every
+    caller that assumes "returned == finished". Test:
+    `entryCallWaitsForParkedCall`.
   - `setPriority`/`setDaemon`/`setName` on a guest `extends Thread`
     (VmObject, no host Thread) are no-ops returning defaults — a
     scheduler hint, not worth marshaling. Tests: `interruptSleep`,
