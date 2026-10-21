@@ -187,6 +187,25 @@ public final class Interpreter {
 				System.err.println("GuestCall " + r.owner + "." + r.name + r.desc
 						+ " from " + f.owner.name + "." + f.method.name + "@" + pc);
 		}
+		if (TRACE_ARGS != null) {
+			if (r.traceArgsMatch == 0)
+				r.traceArgsMatch = (byte) (traceArgsMatches(r.owner + "." + r.name + r.desc) ? 2 : 1);
+			if (r.traceArgsMatch == 2) {
+				StringBuilder sb = new StringBuilder("GuestArgs ")
+						.append(r.owner).append('.').append(r.name).append(r.desc)
+						.append(" from ").append(f.owner.name).append('.')
+						.append(f.method.name).append('@').append(pc).append(" [");
+				int base = f.sp - r.argSlots() - (kind == 1 ? 0 : 1);
+				for (int i = Math.max(0, base); i < f.sp; i++) {
+					Object v = f.stack[i];
+					sb.append(v instanceof byte[] ? "byte[" + ((byte[]) v).length + "]"
+							: v instanceof int[] ? "int[" + ((int[]) v).length + "]"
+							: v instanceof short[] ? "short[" + ((short[]) v).length + "]"
+							: String.valueOf(v)).append(',');
+				}
+				System.err.println(sb.append(']'));
+			}
+		}
 		VmClass owner = r.ownerClass;
 		if (owner == null)
 			r.ownerClass = owner = vm.resolveClass(r.owner);
@@ -586,7 +605,9 @@ public final class Interpreter {
 	public static volatile boolean TRACE = false;
 	public static volatile boolean TRACE_THROWS = false;
 	public static volatile String TRACE_CALLS = null;
+	public static volatile String TRACE_ARGS = null;
 	private static volatile java.util.regex.Pattern traceCallsPattern;
+	private static volatile java.util.regex.Pattern traceArgsPattern;
 	private static final java.util.Set<String> TRACE_SEEN =
 			java.util.concurrent.ConcurrentHashMap.newKeySet();
 
@@ -597,6 +618,15 @@ public final class Interpreter {
 		if (traceCallsPattern == null || !traceCallsPattern.pattern().equals(rx))
 			traceCallsPattern = java.util.regex.Pattern.compile(rx);
 		return traceCallsPattern.matcher(sig).matches();
+	}
+
+	private static boolean traceArgsMatches(String sig) {
+		String rx = TRACE_ARGS;
+		if (rx == null)
+			return false;
+		if (traceArgsPattern == null || !traceArgsPattern.pattern().equals(rx))
+			traceArgsPattern = java.util.regex.Pattern.compile(rx);
+		return traceArgsPattern.matcher(sig).matches();
 	}
 
 	private static int step(Vm vm, VmThread t, Frame f, int remaining, int depth) {

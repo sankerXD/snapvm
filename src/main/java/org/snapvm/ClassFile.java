@@ -59,6 +59,7 @@ final class ClassFile {
 		VmClass cacheDecl;
 		Vm.FastCall cacheFast;           // registered host fast-path for the resolved guest method, if any
 		byte traceCallMatch;             // 0 untested, 1 no, 2 yes — TRACE_CALLS is fixed at startup
+		byte traceArgsMatch;             // same, for TRACE_ARGS
 
 		int argSlots() {
 			if (argSlots < 0)

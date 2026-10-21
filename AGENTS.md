@@ -366,3 +366,41 @@ Gradle 8.7's Kotlin DSL cannot parse newer JDK version strings — if
   - Test: `staleObjectCallsDropped` — pre-restore VmObject's putstatic
     would hit shared statics; asserts the call is dropped AND a live
     receiver still runs.
+- 24-特别行动 stall fix (Oct 2025, JL-Modern adapter) — game sat at its
+  loading bar forever (~0.4 MIPS vs the golf's 2-3): the loading loop
+  calls `serviceRepaints` dozens of times per tick, and the old bridge
+  always went `callParked → EQ marker → done.run()` — a ~4-5ms
+  cross-thread round trip per call that dominated the guest's own work.
+  Fix: when the parked-call handler already holds `execLock` (which it
+  always does — `callParked` invokes handlers synchronously under it),
+  skip the marker entirely and paint inline on the same thread. Three
+  traps this opened, in order:
+  - **ABBA deadlock (white screen, telemetry flat)**: first version
+    called `PaintEvent.process()` which is `synchronized` — pump held
+    `execLock` and wanted `paintEvent`, the EQ held `paintEvent` and its
+    guest paint wanted `execLock`. Fix: inline path never touches the
+    `PaintEvent` monitor; it drains `clip`, runs guest paint, copies the
+    offscreen buffer — surface ops stay on the EQ.
+  - **Skia SIGSEGV on `SkCanvas::~SkCanvas` / `clipRect`**: sharing
+    `offscreen.getSingleGraphics()` between pump and EQ meant two host
+    threads mutating one native `android.graphics.Canvas` — `Graphics.
+    reset()` calls `canvas.setBitmap(null)` then `setBitmap(bitmap)`,
+    and concurrent setBitmap/clipRect is fatal. Fix: inline paint uses
+    a **separate `Graphics` instance** (own native canvas) bound to the
+    same backing bitmap; guest code itself is still serialized by
+    `execLock`, so pixel writes can't overlap anyway.
+  - **surface lifecycle race**: `repaintScreen` read `surface` outside
+    `surfaceLock`; destroy could null it between the check and
+    `lockCanvas`. Moved the null/valid check inside the lock; surface
+    destruction also takes `surfaceLock`.
+  - Semantic fix that fell out: `flushBuffer` used
+    `Thread.holdsLock(paintEvent)` to detect "inside paint()" — the
+    inline path doesn't hold that monitor, so mid-paint flushes wrote
+    into `offscreenCopy` and were overwritten. Replaced with an explicit
+    `inPaint` flag around both paint call sites.
+  - Side fix: `dumpThreads(deep)` now takes `execLock` before `threads`
+    (frames are execLock-owned; iterating under only `threads` raced
+    the interpreter's frame push/pop → sporadic IndexOutOfBounds).
+  - Result on device: loading MIPS 0.4-0.8 → 12-25, game reaches its
+    language select / menu and plays; 3D迷你高尔夫 unaffected.
+    `Vm.inExecLock()` is the public probe the adapter uses.
