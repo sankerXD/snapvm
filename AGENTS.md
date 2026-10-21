@@ -280,7 +280,14 @@ Gradle 8.7's Kotlin DSL cannot parse newer JDK version strings — if
     `exists()` works but the app can't write them — so the gate and
     the log are separate files).
   - `Interpreter.TRACE_CALLS` is a `.matches()` regex — use `.*x.*`
-    shapes, not bare substrings.
+    shapes, not bare substrings. The match result is memoized per
+    `ClassFile.Ref` (`traceCallMatch`) — regex fixed at VM load.
+    BEFORE that cache, a leftover `snapvm.tracecalls` marker cost
+    ~90% of pump-thread CPU (MatcherNative churn per invoke) and ran
+    the game at 4 fps with input starving on execLock — the marker
+    is a plain file, always delete it when done; `snapvm.prof`/
+    `snapvm.sample` are polled live, `trace`/`tracecalls` are
+    read once at SnapVm.load so removing them needs an app restart.
   - **`TRACE_CALLS`/`GuestCall` does NOT cover host→guest calls** —
     `callFromHost` (every keyPressed/paint/serviceRepaints injection)
     bypasses `Interpreter.invoke`, so "0 GuestCall lines for keyXxx"
