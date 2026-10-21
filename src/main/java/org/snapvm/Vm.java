@@ -34,6 +34,12 @@ public final class Vm {
 	final Map<String, String> interned = new HashMap<>();
 	final IdentityHashMap<Object, Monitor> monitors = new IdentityHashMap<>();
 	final IdentityHashMap<Object, Object> proxies = new IdentityHashMap<>();   // proxy -> guest obj
+	/** serial -> live guest object; lets pre-restore host proxies reach the revived object. */
+	final Map<Long, VmObject> liveBySerial = new HashMap<>();
+	private int dropLogCount;
+	private long nextSerial = 1; // monotonic across restores; never reset
+	long nextThreadSerial = 1;   // thread identity across restores; never reset
+	private int threadCreates;   // since-last-sweep counter for corpse culling
 	final IdentityHashMap<Thread, Object> greenTargets = new IdentityHashMap<>(); // host Thread -> guest Runnable
 	final IdentityHashMap<Object, VmClass> guestArrayTypes = new IdentityHashMap<>();
 	final Properties j2meProps = new Properties();
@@ -41,6 +47,9 @@ public final class Vm {
 	final HostBridge bridge = new HostBridge(this);
 
 	private final List<ClassSource> sources = new ArrayList<>();
+	/** guest class name -> substitute host class (adapter-installed; e.g. a
+	 *  Timer subclass whose internals are reachable without reflection). */
+	final Map<String, Class<?>> hostAliases = new HashMap<>();
 	final List<VmThread> threads = new ArrayList<>();
 	int rrCursor; // round-robin scan start; a busy thread must not starve later ones
 	final Map<Class<?>, ShadowFactory> shadowFactories = new HashMap<>();
@@ -55,6 +64,23 @@ public final class Vm {
 	 * into the live graph — statics are shared across epochs via VmClass.
 	 */
 	int epoch;
+
+	/**
+	 * Lazily assign/fetch the cross-restore serial for {@code o} and index it
+	 * in {@link #liveBySerial}. Only proxy-bound objects pay for an entry.
+	 * Skips serials already claimed by revived objects.
+	 */
+	synchronized long serialFor(VmObject o) {
+		long s = o.serial;
+		if (s == 0) {
+			do {
+				s = nextSerial++;
+			} while (liveBySerial.containsKey(s));
+			liveBySerial.put(s, o);
+			o.serial = s;
+		}
+		return s;
+	}
 	/** guest-visible thread key (host Thread or VmObject for guest-extends-Thread) -> green thread */
 	final IdentityHashMap<Object, VmThread> greenThreads = new IdentityHashMap<>();
 	// package-visible for VmSampler's guest-frame attribution
@@ -233,6 +259,22 @@ public final class Vm {
 			public Object revive(Vm vm, Object rec) {
 				return new java.io.DataInputStream(
 						new ByteArrayInputStream((byte[]) rec));
+			}
+		});
+		// Games park ByteArrayOutputStream buffers in statics (3D足球 resource
+		// staging). Whole state is the buffered bytes; toByteArray() copies
+		// them out without touching JDK internals.
+		registerHostHandle(java.io.ByteArrayOutputStream.class, new HostHandle() {
+			public Object capture(Vm vm, Object h) {
+				return ((java.io.ByteArrayOutputStream) h).toByteArray();
+			}
+
+			public Object revive(Vm vm, Object rec) {
+				java.io.ByteArrayOutputStream bos =
+						new java.io.ByteArrayOutputStream();
+				byte[] b = (byte[]) rec;
+				bos.write(b, 0, b.length);
+				return bos;
 			}
 		});
 	}
@@ -418,6 +460,16 @@ public final class Vm {
 		sources.add(src);
 	}
 
+	/**
+	 * Substitute {@code cls} for the host class a guest name resolves to.
+	 * Must be installed before the class is first resolved (resolution is
+	 * cached). Adapter use only — e.g. a Timer subclass whose internals are
+	 * reachable without reflection.
+	 */
+	public void addHostAlias(String name, Class<?> cls) {
+		hostAliases.put(name, cls);
+	}
+
 	/** Value returned to guest code for {@code System.getProperty(key)}. */
 	public void setJ2meProperty(String key, String value) {
 		if (value != null)
@@ -489,7 +541,9 @@ public final class Vm {
 		}
 		// host fallback
 		try {
-			Class<?> hc = Class.forName(name.replace('/', '.'));
+			Class<?> aliased = hostAliases.get(name);
+			Class<?> hc = aliased != null
+					? aliased : Class.forName(name.replace('/', '.'));
 			c = new VmClass(this, name, hc);
 			classes.put(name, c);
 			return c;
@@ -561,8 +615,50 @@ public final class Vm {
 		VmThread t = new VmThread(this);
 		synchronized (threads) {
 			threads.add(t);
+			if (++threadCreates >= 1024) {
+				threadCreates = 0;
+				cullDeadThreads();
+			}
 		}
 		return t;
+	}
+
+	/**
+	 * Drop TERMINATED threads nothing can observe — host-entry corpses pile up
+	 * at ~1 per host event otherwise, and every one costs a record in each
+	 * snapshot. Kept: live threads, corpses still bound to a Thread box
+	 * (greenThreads values — guest isAlive()/join() needs the object), and
+	 * corpses referenced by kept threads' join links (fixpoint).
+	 */
+	void cullDeadThreads() {
+		IdentityHashMap<VmThread, Boolean> keep = new IdentityHashMap<>();
+		synchronized (greenThreads) {
+			for (VmThread t : greenThreads.values())
+				keep.put(t, Boolean.TRUE);
+		}
+		synchronized (threads) {
+			for (VmThread t : threads)
+				if (t.isAlive())
+					keep.put(t, Boolean.TRUE);
+			boolean changed = true;
+			while (changed) {
+				changed = false;
+				for (VmThread t : threads) {
+					if (!keep.containsKey(t))
+						continue;
+					if (t.joinTarget != null
+							&& keep.put(t.joinTarget, Boolean.TRUE) == null) {
+						changed = true;
+					}
+					synchronized (t.joinWaiters) {
+						for (VmThread w : t.joinWaiters)
+							if (keep.put(w, Boolean.TRUE) == null)
+								changed = true;
+					}
+				}
+			}
+			threads.removeIf(t -> !t.isAlive() && !keep.containsKey(t));
+		}
 	}
 
 	void wake(VmThread t) {
@@ -574,24 +670,58 @@ public final class Vm {
 		return dumpThreads(false);
 	}
 
+	/**
+	 * Guest stack of the thread currently executing a host call, or null when
+	 * not on the executor path — for logging from inside host methods.
+	 */
+	public String guestStackTop() {
+		if (Thread.currentThread() != executorThread || executor == null) {
+			return null;
+		}
+		StringBuilder sb = new StringBuilder();
+		sb.append("[gt").append(Integer.toHexString(
+				System.identityHashCode(executor))).append("] ");
+		for (int i = executor.frames.size() - 1; i >= 0; i--) {
+			Frame f = executor.frames.get(i);
+			sb.append(f.owner.name).append('.').append(f.method.name)
+					.append('@').append(f.pc);
+			if (i > 0) {
+				sb.append(" <- ");
+			}
+		}
+		return sb.toString();
+	}
+
+	/** Identity of the green thread currently inside a host call, or 0. */
+	public int guestThreadId() {
+		if (Thread.currentThread() != executorThread || executor == null) {
+			return 0;
+		}
+		return System.identityHashCode(executor);
+	}
+
 	/** deep=true also prints a locals[0] field summary per frame (guest objects only). */
 	public String dumpThreads(boolean deep) {
 		StringBuilder sb = new StringBuilder();
-		synchronized (threads) {
-			for (VmThread t : threads) {
-				if (!t.isAlive() && !deep)
-					continue;
-				sb.append("t#").append(Integer.toHexString(System.identityHashCode(t)))
-						.append(" state=").append(t.state)
-						.append(t.waitMonitor != null ? " waitMon" : "")
-						.append(" frames=").append(t.frames.size()).append('\n');
-				for (int i = t.frames.size() - 1; i >= 0 && i > t.frames.size() - 4; i--) {
-					Frame f = t.frames.get(i);
-					sb.append("  at ").append(f.owner.name).append('.')
-							.append(f.method.name).append(f.method.desc)
-							.append(" @").append(f.pc).append('\n');
-					if (deep && f.locals.length > 0 && f.locals[0] instanceof VmObject)
-						appendFields(sb, (VmObject) f.locals[0]);
+		// frames mutate under execLock, the list under threads — take execLock
+		// outermost to match the global execLock→threads order.
+		synchronized (execLock) {
+			synchronized (threads) {
+				for (VmThread t : threads) {
+					if (!t.isAlive() && !deep)
+						continue;
+					sb.append("t#").append(Integer.toHexString(System.identityHashCode(t)))
+							.append(" state=").append(t.state)
+							.append(t.waitMonitor != null ? " waitMon" : "")
+							.append(" frames=").append(t.frames.size()).append('\n');
+					for (int i = t.frames.size() - 1; i >= 0 && i > t.frames.size() - 4; i--) {
+						Frame f = t.frames.get(i);
+						sb.append("  at ").append(f.owner.name).append('.')
+								.append(f.method.name).append(f.method.desc)
+								.append(" @").append(f.pc).append('\n');
+						if (deep && f.locals.length > 0 && f.locals[0] instanceof VmObject)
+							appendFields(sb, (VmObject) f.locals[0]);
+					}
 				}
 			}
 		}
@@ -826,6 +956,7 @@ public final class Vm {
 		VmClass c = resolveClass(className);
 		VmThread t = newThread();
 		t.hostThread = Thread.currentThread();
+		t.hostEntry = true;
 		ensureInitBlocking(c, t);
 		pushStatic(t, c, method, desc, args);
 		runUntilDone(t);
@@ -845,6 +976,7 @@ public final class Vm {
 			throw new VmError("not a guest class: " + className);
 		VmThread t = newThread();
 		t.hostThread = Thread.currentThread();
+		t.hostEntry = true;
 		ensureInitBlocking(c, t);
 		VmObject o = new VmObject(c);
 		pushInvoke(t, o, "<init>", "()V", new Object[]{o});
@@ -857,6 +989,7 @@ public final class Vm {
 	public Object invokeVirtual(Object recv, String name, String desc, Object... args) {
 		VmThread t = newThread();
 		t.hostThread = Thread.currentThread();
+		t.hostEntry = true;
 		Object[] a = joinArgs(recv, args);
 		if (recv instanceof VmObject) {
 			pushInvoke(t, recv, name, desc, a);
@@ -877,9 +1010,26 @@ public final class Vm {
 	 * on an event-queue marker) cannot deadlock against another host executor
 	 * that needs the lock to produce the wakeup.
 	 */
+	/**
+	 * True when the current thread holds execLock, i.e. is inside a slice or
+	 * nested host call. A parked-call handler may use this to run another
+	 * guest entry inline on the same host thread without waiting for an
+	 * external executor — execLock is reentrant and nested entry threads are
+	 * independent VmThreads.
+	 */
+	public boolean inExecLock() {
+		return Thread.holdsLock(execLock);
+	}
+
 	private void runUntilDone(VmThread t) {
 		for (;;) {
 			synchronized (execLock) {
+				if (t.restoreOrphan) {
+					// a restore replaced this thread: the revived copy carries
+					// the continuation — abandon the stale-graph call
+					t.terminate();
+					return;
+				}
 				if (canRun(t))
 					totalOps += runSlice(t, Long.MAX_VALUE);
 				if (!t.isAlive())
@@ -1088,8 +1238,10 @@ public final class Vm {
 			final Object... args) {
 		if (recv instanceof VmObject && ((VmObject) recv).epoch != epoch) {
 			// receiver belongs to a discarded pre-restore graph — dropping the
-			// call; anything it touched would corrupt the live graph's statics
-			System.err.println("GuestDrop: " + name + desc + " on stale " + recv);
+			// call; anything it touched would corrupt the live graph's statics.
+			// Cap the log: a queued TimerTask can fire this every tick forever.
+			if (dropLogCount++ < 100)
+				System.err.println("GuestDrop: " + name + desc + " on stale " + recv);
 			return null;
 		}
 		VmThread cur;
@@ -1105,8 +1257,53 @@ public final class Vm {
 		}
 		VmThread t = newThread();
 		t.hostThread = Thread.currentThread();
+		t.hostEntry = true;
 		synchronized (execLock) {
 			pushInvoke(t, recv, name, desc, joinArgs(recv, args));
+		}
+		runUntilDone(t);
+		if (t.lastError != null)
+			throw t.lastError;
+		return t.result;
+	}
+
+	/**
+	 * Host callback addressed by serial: resolves the live object for
+	 * {@code serial} and enqueues the invocation in one execLock section, so a
+	 * restore cannot land between lookup and dispatch — a queued host event
+	 * always reaches the epoch that owns the object it points at.
+	 * @return the call result, or {@link #DROPPED} when the serial has no live
+	 *         object (the guest was discarded pre-save or never snapshotted).
+	 */
+	public Object callForSerial(long serial, String name, String desc,
+			Object... args) {
+		VmThread cur;
+		if (Thread.currentThread() == executorThread && (cur = executor) != null) {
+			// nested inside a slice: execLock already held by this thread
+			VmObject g;
+			synchronized (this) {
+				g = liveBySerial.get(serial);
+			}
+			if (g == null || g.isStale())
+				return DROPPED;
+			int depth = cur.frames.size();
+			pushInvoke(cur, g, name, desc, joinArgs(g, args));
+			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
+			return cur.nestedResult;
+		}
+		VmThread t = newThread();
+		t.hostThread = Thread.currentThread();
+		t.hostEntry = true;
+		synchronized (execLock) {
+			VmObject g;
+			synchronized (this) {
+				g = liveBySerial.get(serial);
+			}
+			if (g == null || g.isStale()) {
+				t.terminate();
+				return DROPPED;
+			}
+			pushInvoke(t, g, name, desc, joinArgs(g, args));
 		}
 		runUntilDone(t);
 		if (t.lastError != null)
@@ -1374,6 +1571,8 @@ public final class Vm {
 	private final Map<String, ParkedCall> parkedCache = new HashMap<>();
 	private static final ParkedCall NONE = (v, t, a, d) -> { };
 	static final Object PARKED = new Object();
+	/** callForSerial result when the serial resolves to no live object. */
+	static final Object DROPPED = new Object();
 
 	/**
 	 * A host-call fast path: invokes directly without reflection/marshal.
@@ -1426,6 +1625,7 @@ public final class Vm {
 	 */
 	public byte[] checkpoint() {
 		synchronized (execLock) {
+			cullDeadThreads();
 			return Snapshot.write(this);
 		}
 	}

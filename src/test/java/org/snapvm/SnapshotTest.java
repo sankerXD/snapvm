@@ -226,6 +226,198 @@ public class SnapshotTest {
 		assertEquals(7, run(vm, "St", "pokeLive")); // restored receiver unaffected
 	}
 
+	// A host-side Runnable proxy (the shape event queues retain for
+	// callSerially) holds only a serial token: after restore it re-resolves to
+	// the revived guest object, so queued callbacks keep delivering. A proxy
+	// whose guest never entered the snapshot resolves to nothing and drops.
+	@Test
+	public void proxyRebindsAcrossRestore() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Pr implements Runnable {"
+						+ " static int hits; static Pr last;"
+						+ " public void run() { hits++; }"
+						+ " public static Object make() { return last = new Pr(); }"
+						+ " public static int check() { return hits; } }");
+		Vm vm = vm(cls);
+		VmObject g = (VmObject) vm.invokeStatic("Pr", "make", "()Ljava/lang/Object;");
+		Runnable r = (Runnable) vm.bridge.proxyFor(g, Runnable.class);
+		Runnable dead = (Runnable) vm.bridge.proxyFor(
+				vm.newGuestObject("Pr"), Runnable.class);
+		vm.proxies.remove(dead); // event discarded pre-save: serial never serialized
+		r.run();
+		assertEquals(1, run(vm, "Pr", "check"));
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		r.run();    // old proxy object, revived guest — must deliver
+		assertEquals(2, run(vm, "Pr", "check"));
+		dead.run(); // serial absent from liveBySerial — silent drop, no throw
+		assertEquals(2, run(vm, "Pr", "check"));
+	}
+
+	// 3D迷你高尔夫 white screen: the game's Display.callSerially loop is
+	// carried by host-side events — each pops a serial proxy which enters the
+	// guest on a NEW entry thread via runUntilDone. A restore landing while
+	// that entry thread was asleep used to orphan it (threads.clear), making
+	// runUntilDone abandon the call: the RunnableEvent completed without
+	// re-posting and the serial chain died permanently. Threads born after
+	// the save (index >= nt) are kept across the wipe instead.
+	@Test
+	public void inflightHostCallSurvivesRestore() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Rp implements Runnable {"
+						+ " static int runs; static Rp last;"
+						+ " public void run() {"
+						+ "  try { Thread.sleep(150); } catch (InterruptedException e) {}"
+						+ "  runs++; }"
+						+ " public static Object make() { return last = new Rp(); }"
+						+ " public static int check() { return runs; } }");
+		Vm vm = vm(cls);
+		VmObject g = (VmObject) vm.invokeStatic("Rp", "make", "()Ljava/lang/Object;");
+		final Runnable r = (Runnable) vm.bridge.proxyFor(g, Runnable.class);
+		byte[] snap = vm.checkpoint();
+
+		// The event queue fires the proxy on its own thread; run() sleeps
+		// inside, so the callback is in-flight when the restore lands.
+		Thread host = new Thread(new Runnable() {
+			public void run() {
+				r.run();
+			}
+		});
+		host.start();
+		Thread.sleep(40);
+		vm.restore(snap);
+		host.join(10000);
+		assertFalse(host.isAlive());
+
+		assertEquals(1, run(vm, "Rp", "check")); // in-flight call completed
+		r.run();                                  // serial re-binds post-restore
+		assertEquals(2, run(vm, "Rp", "check"));
+	}
+
+	// The dual case: an entry thread already in-flight AT save time is covered
+	// by the snapshot — the revived copy owns the continuation. The stale
+	// original must not also finish, or the callback body would run twice.
+	@Test
+	public void coveredInflightCallNotDoubleRun() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Rq implements Runnable {"
+						+ " static int runs; static Rq last;"
+						+ " public void run() {"
+						+ "  try { Thread.sleep(150); } catch (InterruptedException e) {}"
+						+ "  runs++; }"
+						+ " public static Object make() { return last = new Rq(); }"
+						+ " public static int check() { return runs; } }");
+		Vm vm = vm(cls);
+		VmObject g = (VmObject) vm.invokeStatic("Rq", "make", "()Ljava/lang/Object;");
+		final Runnable r = (Runnable) vm.bridge.proxyFor(g, Runnable.class);
+
+		Thread host = new Thread(new Runnable() {
+			public void run() {
+				r.run();
+			}
+		});
+		host.start();
+		Thread.sleep(40);
+		byte[] snap = vm.checkpoint(); // entry thread captured mid-sleep
+		vm.restore(snap);              // original orphaned; revived copy resumes
+		host.join(10000);
+		assertFalse(host.isAlive());
+
+		long deadline = System.currentTimeMillis() + 3000;
+		while (System.currentTimeMillis() < deadline
+				&& (Integer) run(vm, "Rq", "check") == 0)
+			vm.pump(20);
+		assertEquals(1, run(vm, "Rq", "check")); // revived copy ran it exactly once
+	}
+
+	// Golf's snapshot grew ~50B per host event: every callSerially/entry call
+	// leaves a TERMINATED corpse in threads[] forever. cullDeadThreads keeps
+	// only threads the graph can still observe (live, box-bound, join-linked),
+	// so a long session stays a handful of records instead of tens of thousands.
+	@Test
+	public void deadEntryThreadsCulled() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Ck {"
+						+ " static int n;"
+						+ " public static int go() { return ++n; } }");
+		Vm vm = vm(cls);
+		for (int i = 0; i < 1100; i++) // > sweep interval: exercises auto-cull too
+			run(vm, "Ck", "go");
+		byte[] snap = vm.checkpoint(); // culls before writing
+		synchronized (vm.threads) {
+			for (VmThread t : vm.threads)
+				assertTrue("corpse survived cull", t.isAlive());
+		}
+		assertTrue("snapshot carrying corpses: " + snap.length,
+				snap.length < 20000);
+		vm.restore(snap);
+		assertEquals(1101, run(vm, "Ck", "go"));
+	}
+
+	// A green thread started between save and restore belongs to the
+	// discarded graph — letting it run would touch stale objects. Restore
+	// terminates it; a live host-entry call (in-flight callback) is the only
+	// post-save thread that survives.
+	@Test
+	public void postSaveGreenThreadTerminated() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Gt {"
+						+ " static Thread w; static int flag;"
+						+ " static class W implements Runnable { public void run() {"
+						+ "  try { Thread.sleep(60000); } catch (InterruptedException e) {}"
+						+ "  flag = 1; } }"
+						+ " public static int start() {"
+						+ "  w = new Thread(new W()); w.start(); return 0; }"
+						+ " public static int alive() { return w.isAlive() ? 1 : 0; } }");
+		Vm vm = vm(cls);
+		byte[] snap = vm.checkpoint();
+		run(vm, "Gt", "start");
+		Thread.sleep(30);
+		assertEquals(1, run(vm, "Gt", "alive"));
+		VmThread green = null;
+		synchronized (vm.threads) {
+			for (VmThread t : vm.threads)
+				if (!t.hostEntry && t.isAlive())
+					green = t;
+		}
+		assertNotNull(green);
+		vm.restore(snap);
+		assertFalse("post-save green thread kept its stale frames", green.isAlive());
+	}
+
+	// callSerially re-proxies the same Runnable every tick — without the
+	// (guest, iface) cache each call minted a fresh Proxy that stayed in
+	// vm.proxies forever, flooding both host memory and the snapshot's
+	// proxy table. One proxy per pair now, and it survives restore.
+	@Test
+	public void proxyPerGuestIfacePair() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Pd implements Runnable {"
+						+ " static int hits; static Pd last;"
+						+ " public void run() { hits++; }"
+						+ " public static Object make() { return last = new Pd(); }"
+						+ " public static Object lastObj() { return last; }"
+						+ " public static int check() { return hits; } }");
+		Vm vm = vm(cls);
+		VmObject g = (VmObject) vm.invokeStatic("Pd", "make", "()Ljava/lang/Object;");
+		Object p1 = vm.bridge.proxyFor(g, Runnable.class);
+		Object p2 = vm.bridge.proxyFor(g, Runnable.class);
+		assertSame("proxy not deduped", p1, p2);
+		assertEquals(1, vm.proxies.size());
+		((Runnable) p1).run();
+		assertEquals(1, run(vm, "Pd", "check"));
+
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		// readProxies recreates the pair — same cache slot on the revived object
+		VmObject g2 = (VmObject) vm.invokeStatic("Pd", "lastObj", "()Ljava/lang/Object;");
+		Object p3 = vm.bridge.proxyFor(g2, Runnable.class);
+		assertNotSame(p1, p3);
+		assertEquals(1, vm.proxies.size());
+		((Runnable) p3).run();
+		assertEquals(2, run(vm, "Pd", "check"));
+	}
+
 	// TIMED_WAITING comes back still asleep (remaining time), and interrupt()
 	// on the restored thread delivers the exception at the sleep call site.
 	@Test
@@ -381,5 +573,53 @@ public class SnapshotTest {
 		Vm fresh = vm(cls);
 		fresh.restore(snap);
 		assertEquals(209, run(fresh, "Di", "check"));
+	}
+
+	// A host thread can slip a newThread() between the tid map build and
+	// writeThreads (newThread locks `threads`, not execLock) — threads born
+	// mid-write must be skipped, not NPE.
+	@Test
+	public void threadBornMidCheckpointSkipped() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Lb {"
+						+ " static StringBuilder box;"
+						+ " public static int go() { box = new StringBuilder(); return 0; } }");
+		Vm vm = vm(cls);
+		final Vm vmF = vm;
+		vm.registerHostHandle(StringBuilder.class, new HostHandle() {
+			public Object capture(Vm v, Object h) {
+				vmF.newThread(); // sneaks in after the tid map is built
+				return null;
+			}
+
+			public Object revive(Vm v, Object rec) {
+				return new StringBuilder();
+			}
+		});
+		run(vm, "Lb", "go");
+		byte[] snap = vm.checkpoint(); // used to NPE in writeThreads
+		vm.restore(snap);
+	}
+
+	// 3D足球 parks a static ByteArrayOutputStream for resource staging —
+	// codec round-trips the buffered bytes and keeps the stream writable.
+	@Test
+	public void byteArrayOutputStreamRoundTrip() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class Bo {"
+						+ " static java.io.ByteArrayOutputStream bos;"
+						+ " public static int go() throws Exception {"
+						+ "  bos = new java.io.ByteArrayOutputStream();"
+						+ "  bos.write(5); bos.write(6);"
+						+ "  return bos.size(); }"
+						+ " public static int check() throws Exception {"
+						+ "  bos.write(7);"
+						+ "  byte[] b = bos.toByteArray();"
+						+ "  return b.length * 100 + b[0] * 10 + b[2]; } }");
+		Vm vm = vm(cls);
+		assertEquals(2, run(vm, "Bo", "go"));
+		byte[] snap = vm.checkpoint();
+		vm.restore(snap);
+		assertEquals(357, run(vm, "Bo", "check")); // len 3, b[0]=5, b[2]=7
 	}
 }

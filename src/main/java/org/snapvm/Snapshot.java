@@ -8,9 +8,11 @@ import java.io.IOException;
 import java.lang.reflect.Array;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Snapshot writer/reader — see docs/snapshot-format.md. Serializes guest
@@ -69,11 +71,14 @@ final class Snapshot {
 
 		void run() throws IOException {
 			out.writeBytes("SNAP");
-			out.writeShort(1);
+			out.writeShort(3); // v3: per-thread serials (position-free covered detection)
 			synchronized (vm.threads) {
 				int ti = 1;
 				for (VmThread t : vm.threads)
-					tids.put(t, ti++);
+					// preserved stale-epoch host callbacks keep stale frames —
+					// serializing them would duplicate graph objects
+					if (t.epoch == vm.epoch)
+						tids.put(t, ti++);
 			}
 			synchronized (vm.monitors) {
 				for (Map.Entry<Object, Vm.Monitor> e : vm.monitors.entrySet())
@@ -125,15 +130,26 @@ final class Snapshot {
 		}
 
 		void writeThreads() throws IOException {
-			out.writeInt(tids.size());
+			int n = 0;
 			synchronized (vm.threads) {
 				for (VmThread t : vm.threads)
-					writeThread(t);
+					if (tids.containsKey(t))
+						n++;
+			}
+			out.writeInt(n);
+			synchronized (vm.threads) {
+				for (VmThread t : vm.threads)
+					// a host thread can callFromHost→newThread mid-write —
+					// it holds threads but not execLock. Threads born after
+					// the id map was built are not part of the frozen state.
+					if (tids.containsKey(t))
+						writeThread(t);
 			}
 		}
 
 		void writeThread(VmThread t) throws IOException {
 			out.writeInt(tids.get(t));
+			out.writeLong(t.serial);
 			out.writeByte(t.state);
 			out.writeLong(t.state == VmThread.TIMED_WAITING
 					? Math.max(0, t.wakeTime - System.currentTimeMillis())
@@ -260,8 +276,12 @@ final class Snapshot {
 		}
 
 		void writeProxies() throws IOException {
-			out.writeInt(vm.proxies.size());
-			for (Map.Entry<Object, Object> e : vm.proxies.entrySet()) {
+			List<Map.Entry<Object, Object>> rows;
+			synchronized (vm.proxies) {
+				rows = new ArrayList<>(vm.proxies.entrySet());
+			}
+			out.writeInt(rows.size());
+			for (Map.Entry<Object, Object> e : rows) {
 				Class<?>[] ifs = e.getKey().getClass().getInterfaces();
 				str(ifs.length > 0 ? ifs[0].getName() : "");
 				value(e.getValue());
@@ -354,10 +374,10 @@ final class Snapshot {
 			} else if (v.getClass() == Object.class) {
 				// plain java.lang.Object: pure identity token (guest lock objects)
 				out.writeByte(K_POBJ);
-			} else if (vm.proxies.containsKey(v)) {
+			} else if (proxyTarget(v) != null) {
 				// a host proxy object in guest state unwraps to its guest
 				out.writeByte(K_PROXY);
-				value(vm.proxies.get(v));
+				value(proxyTarget(v));
 			} else {
 				HostHandle h = findHandle(v.getClass());
 				if (h == null)
@@ -367,6 +387,12 @@ final class Snapshot {
 				out.writeByte(K_HANDLE);
 				str(v.getClass().getName());
 				value(h.capture(vm, v));
+			}
+		}
+
+		Object proxyTarget(Object v) {
+			synchronized (vm.proxies) {
+				return vm.proxies.get(v);
 			}
 		}
 
@@ -387,6 +413,7 @@ final class Snapshot {
 		void writeObj(VmObject o) throws IOException {
 			out.writeByte(K_OBJ);
 			str(o.clazz.name);
+			out.writeLong(o.serial); // 0 unless this obj was proxied to host code
 			out.writeInt(o.fields.length);
 			for (Object f : o.fields)
 				value(f);
@@ -487,8 +514,9 @@ final class Snapshot {
 		void run() throws IOException {
 			byte[] magic = new byte[4];
 			in.readFully(magic);
+			ver = in.readShort();
 			if (!"SNAP".equals(new String(magic, StandardCharsets.US_ASCII))
-					|| in.readShort() != 1)
+					|| (ver != 2 && ver != 3))
 				throw new VmError("bad snapshot header");
 			objs.add(null);
 			threadById.add(null);
@@ -497,9 +525,24 @@ final class Snapshot {
 			for (VmClass c : vm.classes.values())
 				if (!c.host)
 					c.resetRuntime();
+			// A prev thread whose serial is in this file was superseded by a
+			// revived copy — its continuation belongs to the copy, so the
+			// original is an orphan. A live host-entry thread absent from the
+			// file was born after the save: keep it so its parked caller
+			// completes and re-binds through serial proxies. Other post-save
+			// threads reference the discarded graph — terminate them.
+			List<VmThread> prev;
+			synchronized (vm.threads) {
+				prev = new ArrayList<>(vm.threads);
+			}
 			vm.threads.clear();
 			vm.monitors.clear();
-			vm.proxies.clear();
+			synchronized (vm.proxies) {
+				vm.proxies.clear();
+			}
+			synchronized (vm) {
+				vm.liveBySerial.clear();
+			}
 			vm.greenThreads.clear();
 			vm.greenTargets.clear();
 			vm.guestArrayTypes.clear();
@@ -507,7 +550,32 @@ final class Snapshot {
 
 			readGlobals();
 			readClasses();
-			readThreads();
+			int nt = readThreads();
+			synchronized (vm.threads) {
+				if (ver >= 3) {
+					for (VmThread t : prev) {
+						if (coveredSerials.contains(t.serial)) {
+							t.restoreOrphan = true;
+						} else if (t.isAlive()) {
+							if (t.hostEntry) {
+								vm.threads.add(t);
+							} else {
+								t.terminate();
+							}
+						}
+					}
+				} else {
+					// v2 fallback: the file's threads occupied prev[0..nt) in
+					// order — close enough for pre-serial saves
+					for (int i = nt; i < prev.size(); i++) {
+						VmThread t = prev.get(i);
+						if (t.isAlive() && t.hostEntry)
+							vm.threads.add(t);
+					}
+					for (int i = 0; i < nt && i < prev.size(); i++)
+						prev.get(i).restoreOrphan = true;
+				}
+			}
 			readMonitors();
 			readArrayTypes();
 			readBoxes();
@@ -521,6 +589,10 @@ final class Snapshot {
 
 		/** {VmClass, initThreadTid} — resolved after all threads are read. */
 		final List<Object[]> pendingInit = new ArrayList<>();
+		int ver;
+		/** serials of the threads this file carries (v3+): prev threads matching
+		 *  one were superseded by a revived copy and must not double-run. */
+		final Set<Long> coveredSerials = new HashSet<>();
 
 		void readGlobals() throws IOException {
 			int np = in.readInt();
@@ -551,7 +623,7 @@ final class Snapshot {
 			}
 		}
 
-		void readThreads() throws IOException {
+		int readThreads() throws IOException {
 			int nt = in.readInt();
 			List<Integer> joinRaw = new ArrayList<>();
 			List<int[]> waiterRaw = new ArrayList<>();
@@ -561,6 +633,10 @@ final class Snapshot {
 				threadById.add(t); // index == tid (ids assigned in list order)
 				if (tid != threadById.size() - 1)
 					throw new VmError("thread id out of order");
+				if (ver >= 3) {
+					t.serial = in.readLong();
+					coveredSerials.add(t.serial);
+				}
 				t.state = in.readByte();
 				long delta = in.readLong();
 				t.wakeTime = t.state == VmThread.TIMED_WAITING
@@ -623,6 +699,7 @@ final class Snapshot {
 						t.joinWaiters.add(w);
 				}
 			}
+			return nt;
 		}
 
 		void replayParked(VmThread t, String key, Object[] args) {
@@ -813,6 +890,15 @@ final class Snapshot {
 				throw new VmError("object class " + cn + " unresolvable");
 			VmObject o = new VmObject(c);
 			objs.set(id, o); // early: cycles back into this object resolve
+			long serial = in.readLong();
+			if (serial != 0) {
+				o.serial = serial;
+				// stale proxies holding this serial rebind here; same monitor
+				// as serialFor since proxyFor can mint on any host thread
+				synchronized (vm) {
+					vm.liveBySerial.put(serial, o);
+				}
+			}
 			int nf = in.readInt();
 			if (nf != o.fields.length)
 				throw new VmError("field count mismatch for " + cn);

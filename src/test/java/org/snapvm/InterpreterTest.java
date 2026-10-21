@@ -1346,4 +1346,21 @@ assertEquals(1001, run(vm, "Sm", "go"));
 		assertTrue(idx >= 0);
 		assertEquals(-1, out.indexOf("GuestCall", idx + 1)); // deduped per callsite
 	}
+
+	// A host method throwing a checked exception must be catchable by a guest
+	// catch(Exception) — 3D迷你高尔夫 died to RecordStoreNotFoundException
+	// escaping past aq.a's catch and killing the midlet's serial Runnable.
+	public static int throwFromHost() throws java.io.IOException {
+		throw new java.io.IOException("simulated host failure");
+	}
+
+	@Test
+	public void hostExceptionCaughtByGuest() throws Exception {
+		Map<String, byte[]> cls = compile(
+				"public class He { public static int go() {"
+						+ " try { return org.snapvm.InterpreterTest.throwFromHost(); }"
+						+ " catch (Exception e) { return 42; } } }");
+		Vm vm = vm(cls);
+		assertEquals(42, run(vm, "He", "go"));
+	}
 }

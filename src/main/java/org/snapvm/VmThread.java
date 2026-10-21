@@ -12,10 +12,14 @@ public final class VmThread {
 	static final int RUNNABLE = 0, BLOCKED = 1, WAITING = 2, TIMED_WAITING = 3, TERMINATED = 4;
 
 	final Vm vm;
+	final int epoch;            // Vm.epoch at construction — stale-thread detection
+	long serial;                // cross-restore identity; written in v3+ snapshots
 	final List<Frame> frames = new ArrayList<>();
 	int state = RUNNABLE;
 	Thread hostThread;          // the java.lang.Thread object the guest sees
 	Object runTarget;           // guest Runnable (proxy or VmObject) for Thread.start()
+	boolean hostEntry;          // a host thread is blocked in runUntilDone on this thread
+	boolean restoreOrphan;      // restore superseded it: a revived copy owns the continuation
 	long wakeTime;              // for sleep/timed wait
 	Object waitMonitor;         // monitor being waited on / contended
 	int waitReleasedCount;      // monitor count to restore after wait() returns
@@ -34,6 +38,8 @@ public final class VmThread {
 
 	VmThread(Vm vm) {
 		this.vm = vm;
+		this.epoch = vm.epoch;
+		this.serial = vm.nextThreadSerial++;
 	}
 
 	Frame top() {

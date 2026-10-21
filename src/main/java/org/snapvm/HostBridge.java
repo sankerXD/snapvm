@@ -83,20 +83,58 @@ final class HostBridge {
 	}
 
 	Object proxyFor(final VmObject guest, final Class<?> iface) {
-		Object p = Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
+		synchronized (vm.proxies) {
+			// one proxy per (guest, iface): event-driven games re-proxy the same
+			// Runnable on every tick — uncached this floods vm.proxies and the
+			// snapshot with tens of thousands of identical entries
+			Object cached = guest.proxies == null ? null : guest.proxies.get(iface);
+			if (cached != null)
+				return cached;
+			final long serial = vm.serialFor(guest);
+			Object p = Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
 				new InvocationHandler() {
 					public Object invoke(Object proxy, Method method, Object[] args) {
+						// Re-resolve per invoke: after Vm.restore the captured guest
+						// is stale, but its serial aliases to the revived object.
+						// callForSerial resolves + enqueues under one execLock
+						// section so a restore can't land between the two.
+						Class<?> rt = method.getReturnType();
 						Object[] in = args == null ? new Object[0] : args.clone();
 						Class<?>[] pts = method.getParameterTypes();
 						for (int i = 0; i < in.length; i++)
 							in[i] = Vm.fromHost(in[i], pts[i].isPrimitive());
-						Object r = vm.callFromHost(guest, method.getName(),
+						Object r = vm.callForSerial(serial, method.getName(),
 								descOf(method), in);
-						return toHost(r, method.getReturnType());
+						if (r == Vm.DROPPED) {
+							droppedSerial(serial, method);
+							return defaultValue(rt);
+						}
+						return toHost(r, rt);
 					}
 				});
-		vm.proxies.put(p, guest);
-		return p;
+			vm.proxies.put(p, guest);
+			if (guest.proxies == null)
+				guest.proxies = new HashMap<>();
+			guest.proxies.put(iface, p);
+			return p;
+		}
+	}
+
+	private static int droppedSerialCount;
+
+	private void droppedSerial(long serial, Method m) {
+		if (droppedSerialCount++ < 100)
+			System.err.println("GuestDrop: " + m.getName() + " on dead serial " + serial);
+	}
+
+	private static Object defaultValue(Class<?> rt) {
+		if (!rt.isPrimitive() || rt == void.class)
+			return null;
+		if (rt == boolean.class) return false;
+		if (rt == long.class) return 0L;
+		if (rt == float.class) return 0f;
+		if (rt == double.class) return 0d;
+		return 0;
 	}
 
 	static String descOf(Method m) {
@@ -248,7 +286,9 @@ final class HostBridge {
 		Class<?> hc = hostClasses.get(ownerName);
 		if (hc == null) {
 			try {
-				hc = Class.forName(ownerName.replace('/', '.'));
+				Class<?> aliased = vm.hostAliases.get(ownerName);
+				hc = aliased != null
+						? aliased : Class.forName(ownerName.replace('/', '.'));
 			} catch (ClassNotFoundException e) {
 				throw new VmError("host class missing " + ownerName);
 			}
