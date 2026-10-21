@@ -13,7 +13,9 @@ public final class VmObject {
 	 */
 	public Object hostShadow;
 	/** Args passed to the first host-super <init> (recv at [0]); kept so host-side
-	 * state that skipped construction (e.g. Throwable's message) stays recoverable. */
+	 * state that skipped construction (e.g. Throwable's message) stays recoverable.
+	 * Assigned before {@link Vm#constructShadow} runs, so ShadowFactory
+	 * implementations can replay the real constructor arguments. */
 	Object[] superCtorArgs;
 	Object exceptionCause;                 // set by Throwable.initCause
 	String exceptionTrace;                 // guest stack captured at construction (printStackTrace)
@@ -43,6 +45,13 @@ public final class VmObject {
 
 	public VmClass vmClass() {
 		return clazz;
+	}
+
+	/** Raw args captured at the host-super {@code <init>} call — receiver at
+	 *  index 0, declared parameters after it. Null when no host super-ctor ran
+	 *  (purely guest-rooted class). Read by adapter {@code ShadowFactory}s. */
+	public Object[] superCtorArgs() {
+		return superCtorArgs;
 	}
 
 	/**

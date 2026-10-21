@@ -33,6 +33,28 @@ public class InterpreterTest {
 		}
 	}
 
+	/**
+	 * Host probe that re-enters the guest from inside a host call — the same
+	 * shape as the inline serviceRepaints drain (guest → parked host call →
+	 * nested callFromHost → guest paint). The paint-side confinement lives in
+	 * the host caller, exactly like Canvas.processPendingRepaint's
+	 * catch(Throwable).
+	 */
+	public static class Reenter {
+		public static Vm vm;
+		public static VmObject target;
+		public static boolean sawError;
+
+		public static void paint() {
+			sawError = false;
+			try {
+				vm.callFromHost(target, "boom", "()V");
+			} catch (VmException e) {
+				sawError = true;
+			}
+		}
+	}
+
 	private Map<String, byte[]> compile(String... sources) throws IOException {
 		JavaCompiler jc = ToolProvider.getSystemJavaCompiler();
 		File dir = Files.createTempDirectory("vmtest").toFile();
@@ -497,6 +519,121 @@ assertEquals(33, run(vm, "D2X2", "go"));
 			}
 		});
 		assertEquals(1, run(vm, "Tt", "go"));
+	}
+
+	/**
+	 * A ShadowFactory runs inside the guest's host-super {@code <init>} call and
+	 * must see that call's real arguments — {@code superCtorArgs} is assigned
+	 * before {@code constructShadow}. Before the reorder a factory reading them
+	 * here saw null (TextBox-family shadows need title/text/maxSize up front).
+	 */
+	@Test
+	public void shadowSeesSuperCtorArgs() throws Exception {
+		Vm vm = vm(compile(
+				"public class Sc {"
+						+ " public static class Box extends java.util.ArrayList {"
+						+ "  public Box() { super(42); } } }"));
+		final int[] seen = {-1};
+		vm.registerShadow(java.util.ArrayList.class, new Vm.ShadowFactory() {
+			public Object create(Vm vm, VmObject guest) {
+				Object[] a = guest.superCtorArgs();
+				seen[0] = a != null && a.length > 1 && a[1] instanceof Integer
+						? (Integer) a[1] : -1;
+				return new java.util.ArrayList(seen[0] < 0 ? 1 : seen[0]);
+			}
+		});
+		VmObject guest = vm.newGuestObject("Sc$Box");
+		assertTrue(guest.hostShadow instanceof java.util.ArrayList);
+		assertEquals(42, seen[0]);
+	}
+
+	/**
+	 * Guest Hashtable.TableEnum.hasMoreElements used to walk the shared bucket
+	 * cursor {@code idx} with a LOCAL variable and never store the found entry
+	 * back into {@code e} — every call consumed a bucket position, so a
+	 * hasMoreElements/nextElement loop skipped chains and nextElement threw
+	 * NoSuchElementException on a non-empty table (real-game failure:
+	 * 暗黑启示录1 dies enumerating during load). The fix writes the lookahead
+	 * into {@code e} like the JDK Enumerator does.
+	 */
+	@Test
+	public void hashtableEnumNoSkip() throws Exception {
+		Vm vm = vm(compile(
+				"public class He {"
+						+ " public static int go() {"
+						+ "  java.util.Hashtable t = new java.util.Hashtable();"
+						+ "  for (int i = 0; i < 20; i++)"
+						+ "    t.put(new Integer(i), new Integer(i));"
+						+ "  int n = 0;"
+						+ "  for (java.util.Enumeration e = t.keys();"
+						+ "       e.hasMoreElements();) {"
+						+ "    e.nextElement(); n++;"
+						+ "  }"
+						+ "  if (n != 20) return -n;"
+						// idempotent: two calls must not consume two entries
+						+ "  java.util.Enumeration v = t.elements();"
+						+ "  if (!v.hasMoreElements() || !v.hasMoreElements())"
+						+ "    return -100;"
+						// deliver every element exactly once via nextElement alone
+						+ "  int m = 0;"
+						+ "  try { while (true) { v.nextElement(); m++; } }"
+						+ "  catch (java.util.NoSuchElementException done) { }"
+						+ "  return m == 20 ? n : -200;"
+						+ " } }"));
+		assertEquals(20, run(vm, "He", "go"));
+	}
+
+	/**
+	 * A guest exception inside a nested callFromHost must NOT unwind past the
+	 * depth boundary into the caller's frames — real J2ME runs
+	 * serviceRepaints' paints on the event thread, where a throwing paint can
+	 * never kill the caller. Before the fix, throwObject unwound everything:
+	 * 宿命传说2's splash paint does getWidth()/0 (corrupt/obfuscated jar,
+	 * intended /2), the throw ate the game thread → black screen forever.
+	 */
+	@Test
+	public void nestedCallThrowConfined() throws Exception {
+		// The real serviceRepaints shape: callFromHost fires INSIDE a parked
+		// call, where the green thread is WAITING — the pushed paint frame
+		// can't run in the nested execute() and defers to after the parked
+		// invoke. Its throw must die at the external frame boundary instead
+		// of unwinding the caller's frames (before the fix: thread ate the
+		// exception → game thread dead → black screen).
+		Map<String, byte[]> cls = compile(
+				"public class Nr { public static int go() { "
+						+ "org.snapvm.InterpreterTest.Reenter.paint();"
+						+ " return 42; } }",
+				"public class Bad { public void boom() { "
+						+ "throw new RuntimeException(\"boom\"); } }");
+		Vm vm = vm(cls);
+		Reenter.vm = vm;
+		Reenter.target = vm.newGuestObject("Bad");
+		Reenter.sawError = false;
+		vm.registerParkedCall("org/snapvm/InterpreterTest/Reenter.paint()V",
+				(v, t, a, done) -> {
+					Reenter.paint();
+					done.run();
+				});
+		assertEquals(42, run(vm, "Nr", "go"));
+	}
+
+	@Test
+	public void nestedCallThrowEscapesToHost() throws Exception {
+		// Inline shape: thread is RUNNABLE, the nested execute() drives the
+		// guest callee itself — the throw confines at the depth boundary and
+		// comes back to the host caller as a VmException (sawError), while
+		// the outer guest frame survives to return 42.
+		Map<String, byte[]> cls = compile(
+				"public class Nr2 { public static int go() { "
+						+ "org.snapvm.InterpreterTest.Reenter.paint();"
+						+ " return 42; } }",
+				"public class Bad2 { public void boom() { "
+						+ "throw new RuntimeException(\"boom\"); } }");
+		Vm vm = vm(cls);
+		Reenter.vm = vm;
+		Reenter.target = vm.newGuestObject("Bad2");
+		assertEquals(42, run(vm, "Nr2", "go"));
+		assertTrue(Reenter.sawError);
 	}
 
 	/** Two green threads: wait() blocks, releases the monitor, notify() wakes it. */

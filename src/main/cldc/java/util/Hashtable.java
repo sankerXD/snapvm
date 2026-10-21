@@ -60,7 +60,7 @@ public class Hashtable {
 		public boolean hasMoreElements() {
 			for (Entry x = e; x != null || idx > 0;) {
 				if (x == null)
-					x = table[--idx];
+					e = x = table[--idx];
 				else
 					return true;
 			}

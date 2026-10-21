@@ -48,17 +48,17 @@ public final class Interpreter {
 				if (t.interruptPc >= 0)
 					f.pc = t.interruptPc; // rewind to the interruptible call so catch ranges match
 				t.interruptPc = -1;
-				throwObject(vm, t, new InterruptedException());
+				throwObject(vm, t, new InterruptedException(), depth);
 				continue;
 			}
 			try {
 				used += step(vm, t, f,
 						(int) Math.min(budget - used, Integer.MAX_VALUE), depth);
 			} catch (VmException e) {
-				throwObject(vm, t, e.thrown);
+				throwObject(vm, t, e.thrown, depth);
 			} catch (RuntimeException e) {
 				// host NPE/CCE/AIOOBE from helpers: surface to guest as throwable
-				throwObject(vm, t, e);
+				throwObject(vm, t, e, depth);
 			}
 		}
 		return used;
@@ -98,7 +98,7 @@ public final class Interpreter {
 
 	// ---------- guest-level throw ----------
 
-	static void throwObject(Vm vm, VmThread t, Object thrown) {
+	static void throwObject(Vm vm, VmThread t, Object thrown, int depth) {
 		String trace = trace(t); // capture before frames are popped
 		if (TRACE_THROWS && !t.frames.isEmpty()) {
 			Frame top = t.top();
@@ -112,7 +112,12 @@ public final class Interpreter {
 			}
 		}
 		boolean callerCallSite = false;
-		while (!t.frames.isEmpty()) {
+		// nested-call boundary: frames at/below depth belong to the enclosing
+		// guest call site, not to this invocation — never unwind into them
+		// (a real VM runs e.g. serviceRepaints' paints on the event thread, so
+		// a throwing paint can never pop the caller's frames either)
+		int keep = Math.max(depth, 0);
+		while (t.frames.size() > keep) {
 			Frame f = t.top();
 			// when a callee frame was just popped, the throw site in this frame is
 			// the invoke instruction, not f.pc (already advanced past it)
@@ -144,15 +149,34 @@ public final class Interpreter {
 			if (handled)
 				return;
 			callerCallSite = f.fromCall;
+			boolean boundary = f.external;
 			popFrame(t, f);
+			if (boundary && t.frames.size() > keep) {
+				// popped an external frame (pushInvoke/pushStatic entry) while
+				// the caller's frames are still below — this throw belongs to
+				// the nested call only. Deferred host→guest work (e.g. a paint
+				// pushed mid-invoke) dies here instead of eating the thread.
+				VmException ve = new VmException(thrown);
+				ve.vmTrace = trace;
+				t.nestedError = ve;
+				System.err.println("SnapVM nested uncaught " + ve + trace);
+				return;
+			}
 		}
 		VmException ve = new VmException(thrown);
 		ve.vmTrace = trace;
-		t.lastError = ve;
-		t.terminate();
-		// uncaught guest exceptions dump the guest trace — this is the only
-		// stack a host-side crash report will ever see
-		System.err.println("SnapVM uncaught " + ve + trace);
+		if (t.frames.isEmpty()) {
+			t.lastError = ve;
+			t.terminate();
+			// uncaught guest exceptions dump the guest trace — this is the only
+			// stack a host-side crash report will ever see
+			System.err.println("SnapVM uncaught " + ve + trace);
+		} else {
+			// unwind stopped at a nested boundary: the nested call died, the
+			// caller thread stays alive; its host caller rethrows this
+			t.nestedError = ve;
+			System.err.println("SnapVM nested uncaught " + ve + trace);
+		}
 	}
 
 	private static void jumpToHandler(Frame f, ClassFile.ExEntry e, Object thrown) {
@@ -255,9 +279,9 @@ public final class Interpreter {
 					// (its own ctor runs the real host super-ctor)
 					Object[] initArgs = popToArray(f, r, true);
 					VmObject g = (VmObject) recv;
-					vm.constructShadow(g, owner);
 					if (g.superCtorArgs == null)
 						g.superCtorArgs = initArgs;
+					vm.constructShadow(g, owner);
 					if (g.exceptionTrace == null
 							&& Throwable.class.isAssignableFrom(owner.hostClass))
 						g.exceptionTrace = trace(t);

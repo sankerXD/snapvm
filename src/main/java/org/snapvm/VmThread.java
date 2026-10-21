@@ -32,6 +32,7 @@ public final class VmThread {
 	Object[] parkedArgs;        // guest args of the in-flight parked call
 	Object result;              // set when entry method returns
 	Object nestedResult;        // nested callFromHost result
+	VmException nestedError;    // uncaught error stopped at a nested-call depth boundary
 	VmException lastError;
 
 	final List<VmThread> joinWaiters = new ArrayList<>();

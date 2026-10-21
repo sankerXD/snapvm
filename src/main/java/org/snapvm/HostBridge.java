@@ -522,8 +522,14 @@ final class HostBridge {
 					vm.ensureInitBlocking(c, t);
 					VmObject o = new VmObject(c);
 					int depth = t.frames.size();
+					t.nestedError = null;
 					vm.pushInvoke(t, o, "<init>", "()V", new Object[]{o});
 					Interpreter.execute(vm, t, Long.MAX_VALUE, depth);
+					if (t.nestedError != null) {
+						VmException ve = t.nestedError;
+						t.nestedError = null;
+						throw ve;
+					}
 					return o;
 				}
 				case "toString": return recv.toString();
@@ -677,8 +683,14 @@ final class HostBridge {
 	 *  String.valueOf / String(CharSequence) receive guest objects). */
 	private String guestToString(VmThread t, VmObject o) {
 		int depth = t.frames.size();
+		t.nestedError = null;
 		vm.pushInvoke(t, o, "toString", "()Ljava/lang/String;", new Object[]{o});
 		Interpreter.execute(vm, t, Long.MAX_VALUE, depth);
+		if (t.nestedError != null) {
+			VmException ve = t.nestedError;
+			t.nestedError = null;
+			throw ve;
+		}
 		Object r = t.nestedResult;
 		return r == null ? null : (String) r;
 	}

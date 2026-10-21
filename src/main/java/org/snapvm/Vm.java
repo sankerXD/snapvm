@@ -1251,8 +1251,14 @@ public final class Vm {
 				return bridge.call(cur, hc.name, name, desc, joinArgs(recv, args), 0);
 			}
 			int depth = cur.frames.size();
+			cur.nestedError = null;
 			pushInvoke(cur, recv, name, desc, joinArgs(recv, args));
 			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
+			if (cur.nestedError != null) {
+				VmException ve = cur.nestedError;
+				cur.nestedError = null;
+				throw ve;
+			}
 			return cur.nestedResult;
 		}
 		VmThread t = newThread();
@@ -1287,8 +1293,14 @@ public final class Vm {
 			if (g == null || g.isStale())
 				return DROPPED;
 			int depth = cur.frames.size();
+			cur.nestedError = null;
 			pushInvoke(cur, g, name, desc, joinArgs(g, args));
 			Interpreter.execute(this, cur, Long.MAX_VALUE, depth);
+			if (cur.nestedError != null) {
+				VmException ve = cur.nestedError;
+				cur.nestedError = null;
+				throw ve;
+			}
 			return cur.nestedResult;
 		}
 		VmThread t = newThread();
