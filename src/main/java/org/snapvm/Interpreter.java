@@ -178,12 +178,15 @@ public final class Interpreter {
 	// kind: 0 virtual/interface, 1 static, 2 special
 	private static void invoke(Vm vm, VmThread t, Frame f, ClassFile.Ref r, int pc, int oplen,
 			int kind) {
-		if (TRACE_CALLS != null
-				&& traceMatches(r.owner + "." + r.name + r.desc)
-				&& TRACE_SEEN.add("C" + r.owner + "." + r.name + r.desc
-						+ "<-" + f.owner.name + "." + f.method.name + "@" + pc))
-			System.err.println("GuestCall " + r.owner + "." + r.name + r.desc
-					+ " from " + f.owner.name + "." + f.method.name + "@" + pc);
+		if (TRACE_CALLS != null) {
+			if (r.traceCallMatch == 0)
+				r.traceCallMatch = (byte) (traceMatches(r.owner + "." + r.name + r.desc) ? 2 : 1);
+			if (r.traceCallMatch == 2
+					&& TRACE_SEEN.add("C" + r.owner + "." + r.name + r.desc
+							+ "<-" + f.owner.name + "." + f.method.name + "@" + pc))
+				System.err.println("GuestCall " + r.owner + "." + r.name + r.desc
+						+ " from " + f.owner.name + "." + f.method.name + "@" + pc);
+		}
 		VmClass owner = r.ownerClass;
 		if (owner == null)
 			r.ownerClass = owner = vm.resolveClass(r.owner);

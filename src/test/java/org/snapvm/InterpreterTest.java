@@ -1320,4 +1320,30 @@ assertEquals(1001, run(vm, "Sm", "go"));
 				}).start());
 		assertEquals(9, vm.invokeStatic("Ep", "go", "()I"));
 	}
+
+	// TRACE_CALLS used to string-build + regex-match every invoke (傲剑江湖
+	// 4-fps: pump thread spent ~90% CPU inside MatcherNative). The match is
+	// now cached per method ref — non-matching invokes pay a byte check.
+	// Output must still hit matching callsites exactly once.
+	@Test
+	public void traceCallsMatchesAndDedups() throws Exception {
+		Vm vm = vm(compile(
+				"public class Tc { public static int go() {"
+						+ " int h = 0; for (int i = 0; i < 3; i++) h += new Object().hashCode() % 2;"
+						+ " return h == 0 ? 7 : h; } }"));
+		java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+		java.io.PrintStream old = System.err;
+		System.setErr(new java.io.PrintStream(bos));
+		try {
+			Interpreter.TRACE_CALLS = ".*hashCode.*";
+			run(vm, "Tc", "go"); // calls hashCode 3x from the same callsite
+		} finally {
+			Interpreter.TRACE_CALLS = null;
+			System.setErr(old);
+		}
+		String out = bos.toString();
+		int idx = out.indexOf("GuestCall java/lang/Object.hashCode()I from Tc.go@");
+		assertTrue(idx >= 0);
+		assertEquals(-1, out.indexOf("GuestCall", idx + 1)); // deduped per callsite
+	}
 }
