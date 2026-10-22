@@ -404,3 +404,74 @@ Gradle 8.7's Kotlin DSL cannot parse newer JDK version strings — if
   - Result on device: loading MIPS 0.4-0.8 → 12-25, game reaches its
     language select / menu and plays; 3D迷你高尔夫 unaffected.
     `Vm.inExecLock()` is the public probe the adapter uses.
+- M6 host-call fast path + 时空旅者 freeze forensics (Oct 2025):
+  - **`Ref.hostFast` per-Ref fast-call cache**: the first call to a given
+    owner.name desc goes through full `HostBridge.call` (map lookup,
+    string key, boxing, parkedCall/fastCall disambiguation); the result
+    is then resolved via `HostBridge.resolveFast` to a reusable lambda
+    cached on the Ref. Later calls run `popToScratch` (reusable
+    `f.scratch` arg array, no per-call `Object[]` alloc) → invoke →
+    push. `HostBridge.NONE` marks "resolved to unsupported" so those
+    don't re-resolve every call. A `BuiltinMarker.NOT_HANDLED` return
+    falls back to a COPIED arg array (never the scratch — a parked call
+    may retain it) and the full path. Refs that resolve to NONE stay
+    there — a later NOT_HANDLED does not demote a working fast path.
+    Effect: ~2 GCs per 5min vs ~50 before (boxing/Object[] churn gone);
+    title-loop ~25 MIPS.
+  - **时空旅者 hard-freeze = `e` class draw-list cycle**: `e.a(Graphics)`
+    rebuilds a K-sorted draw list each paint — traverses `e.N[]` (active
+    actors), insertion-sorts into `e.aL[]` (next-link per slot). The
+    freeze was `aL` carrying a cycle (`8→42→44→8`, `{5↔6}`, `{13}`),
+    so the inner sort-walk `i4 = aL[i4]` spins forever at 27 MIPS while
+    holding execLock — paints stop, key events starve, screen frozen.
+  - **Root: cross-thread list mutation mid-traversal**. `watchS`/`watchN`
+    probes (below) caught it: the `aL[i2]=i4` write logged `aL[13]=13`
+    (self-loop — i2 revisited = i4), and the `N[]` saload trace showed
+    `N[32]` change `33→35` and `N[33]` `35→31→32` **between adjacent
+    reads of one pass** — another thread mutated the active list while
+    `e.a` was mid-build → torn traversal → duplicate insert → cycle.
+    The game's list ops are unsynchronized; on a real J2ME the paint
+    window is sub-ms so the race never loses — green-thread scheduling
+    widens it enormously.
+  - Same corruption family, different surface: `e.bE == null` because
+    the decode produced `bD=0` (count byte at `c[i0]` zero) → `e.a(Z)`
+    `bE[W]` NPE-loops forever (the thread survives via nestedError so
+    it keeps retrying — screen frozen at 资源加载中).
+  - **Runaway-frame watchdog**: `Frame.ops` accumulates ops spent with
+    that frame at top-of-stack across slices (per-frame, NOT per-step
+    — round-robin slices reset step counters mid-wedge). At
+    `Interpreter.RUNAWAY_OPS` (500M) `execute` throws a `VmException`
+    wrapping `InternalError` — unwinds guest frames like a normal
+    exception (does NOT kill the VmThread — a `VmError` would escape
+    execute and kill the pump/EQ thread). The next paint's build
+    overwrites `aL` fresh → self-heals. Legit frames stay <~1M ops;
+    a wedged frame hits 500M in ~20s at 25 MIPS.
+  - **Forensics (debug-only, keep)**: `Ref.watchA` marks `e.aL`/`e.N`
+    putstatics (1/3); `Vm.watchS`/`watchN` track the live arrays.
+    `sastore` into `watchS` runs `watchProbe` — walks the chain from
+    i1 (local 1) after the `aL[i2]=i4` store (idx==local 2 filters the
+    `aL[i5]=i2` predecessor write whose stale-tail read false-positives),
+    logs frame+locals+chain+nTrace on revisit. `saload` on `watchN` runs
+    `nProbe` → 4096-entry ring buffer of `idx->value` reads, dumped on
+    cycle. stderr goes through the `snapvm.err` gate → `snapvm_err.log`.
+  - `Vm.staticMap(className)` dumps a loaded guest class's statics
+    lock-free (the whole point: the executor is wedged holding execLock
+    so no lock may be taken); adapter `snapvm.statics` marker → writes
+    class name → `dumpStatics` walks N/aL/O/aK/aM/aO/M/aJ/aI/c/bD/W.
+  - **ROOT CAUSE — two concurrent `e.a` builds (adapter bug, M5c side
+    effect)**: `e.run` does `repaint(); serviceRepaints();` per frame.
+    `repaint()` posts paintEvent to the EQ → its dispatch thread later
+    runs `PaintEvent.process()` → `e.paint` on the EQ; `serviceRepaints`
+    takes the M5c inline path → `processPendingRepaint()` → `e.paint` on
+    the pump. `process()` is `synchronized(paintEvent)` but the inline
+    path deliberately bypasses that monitor (M5c ABBA fix) — so the two
+    paths can hold `e.a` concurrently once a second clip arms mid-paint.
+    Clip dedup guarantees one winner PER ARM, but not per FRAME — a
+    repaint() landing during the sibling's in-flight paint produces two
+    parallel `e.a` builds sharing `aL[]`/`N[]` → interleaved link writes
+    → the cycle. On real J2ME both paints are on the EDT — serialized.
+    Fix (app repo, `Canvas.java`): `inPaint` is now the serialization
+    gate, checked AND set under `synchronized(clip)` in BOTH paths —
+    a second request re-arms its clip and returns instead of racing;
+    the next drain paints it. Frames drop, lists never tear. Verified
+    on-device: the transition that wedged every run now enters gameplay.

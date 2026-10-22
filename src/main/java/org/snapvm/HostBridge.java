@@ -335,6 +335,74 @@ final class HostBridge {
 		NOT_HANDLED
 	}
 
+	/**
+	 * A resolved, reusable host-call path cached per call-site {@link ClassFile.Ref}
+	 * — same shape as {@link Vm.FastCall} but carries the running {@link VmThread}
+	 * for builtins that need it (String/Class semantics).
+	 */
+	interface ResolvedCall {
+		Object invoke(VmThread t, Object[] args) throws Exception;
+	}
+
+	/** {@link ClassFile.Ref#hostFast} marker for "resolved to no fast path" —
+	 *  without it, unresolvable sites (parked calls, reflection) would retry
+	 *  resolveFast on every call and double their dispatch cost. */
+	static final ResolvedCall NONE = (t, a) -> { throw new AssertionError("unreachable"); };
+
+	/**
+	 * Resolve an owner.host call site to a reusable path for {@link ClassFile.Ref#hostFast}
+	 * caching. Returns null for anything that must keep going through {@link #call0}:
+	 * parked calls (park semantics), semantic builtins (Object/Class/Thread/
+	 * Throwable), reflection and constructors. The returned lambda mirrors
+	 * {@link #fastBuiltin}'s contract — {@link BuiltinMarker#NOT_HANDLED} for any
+	 * shape it doesn't cover, so the caller can fall back to the full dispatch.
+	 * Resolution happens once per Ref; adapter registrations happen at load time
+	 * before guest code runs.
+	 */
+	ResolvedCall resolveFast(String owner, String name, String desc, int kind) {
+		if (kind == 3)
+			return NONE;
+		if (vm.parkedCall(owner, name, desc) != null)
+			return NONE;
+		Vm.FastCall fc = vm.fastCall(owner, name, desc);
+		if (fc != null)
+			return (t, a) -> fc.invoke(a);
+		switch (owner) {
+			case "java/util/Vector": return guarded(kind, (t, a) -> vectorBuiltin(name, desc, a, kind));
+			case "java/util/Stack": return guarded(kind, (t, a) -> stackBuiltin(name, desc, a, kind));
+			case "java/util/Hashtable": return guarded(kind, (t, a) -> tableBuiltin(name, desc, a, kind));
+			case "java/util/Enumeration": return guarded(kind, (t, a) -> enumBuiltin(name, a));
+			case "java/util/Random": return guarded(kind, (t, a) -> randomBuiltin(name, desc, a, kind));
+			case "java/lang/String": return guarded(kind, (t, a) -> stringBuiltin(t, name, desc, a, kind));
+			case "java/lang/StringBuffer":
+			case "java/lang/StringBuilder": return guarded(kind, (t, a) -> sbBuiltin(name, desc, a));
+			case "java/lang/Math": return guarded(kind, (t, a) -> mathBuiltin(name, desc, a));
+			case "java/lang/Integer": return guarded(kind, (t, a) -> intBuiltin(name, desc, a, kind));
+			case "java/lang/Long": return guarded(kind, (t, a) -> longBuiltin(name, desc, a, kind));
+			case "java/lang/Float": return guarded(kind, (t, a) -> floatBuiltin(name, desc, a, kind));
+			case "java/lang/Double": return guarded(kind, (t, a) -> doubleBuiltin(name, desc, a, kind));
+			case "java/io/InputStream":
+			case "java/io/ByteArrayInputStream":
+			case "java/io/FilterInputStream":
+			case "java/io/BufferedInputStream":
+				return guarded(kind, (t, a) -> isBuiltin(name, desc, a));
+			case "java/io/DataInputStream": return guarded(kind, (t, a) -> disBuiltin(name, desc, a));
+			case "java/lang/System":
+				return kind == 1 ? (t, a) -> systemBuiltin(name, desc, a) : NONE;
+			case "java/lang/reflect/Array":
+				return kind == 1 ? (t, a) -> arrayBuiltin(name, desc, a) : NONE;
+		}
+		return NONE;
+	}
+
+	/** kind 0/2 args[0] is the receiver — a guest object must fall back to call0. */
+	private static ResolvedCall guarded(int kind, ResolvedCall c) {
+		if (kind == 1)
+			return c;
+		return (t, a) -> a.length > 0 && a[0] instanceof VmObject
+				? BuiltinMarker.NOT_HANDLED : c.invoke(t, a);
+	}
+
 	// ---------- java.lang.* builtins ----------
 
 	private Object builtin(VmThread t, String owner, String name, String desc, Object[] args, int kind) {

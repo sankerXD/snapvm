@@ -52,8 +52,14 @@ public final class Interpreter {
 				continue;
 			}
 			try {
-				used += step(vm, t, f,
+				int r = step(vm, t, f,
 						(int) Math.min(budget - used, Integer.MAX_VALUE), depth);
+				used += r;
+				Frame top = t.top();
+				if (top != null && (top.ops += r) > RUNAWAY_OPS)
+					throw new VmException(new InternalError(
+							"runaway frame " + top.describe()
+									+ " — guest loop " + top.ops + " ops"));
 			} catch (VmException e) {
 				throwObject(vm, t, e.thrown, depth);
 			} catch (RuntimeException e) {
@@ -235,10 +241,7 @@ public final class Interpreter {
 			r.ownerClass = owner = vm.resolveClass(r.owner);
 		if (kind == 1) {
 			if (owner.host) {
-				Object[] args = popToArray(f, r, false);
-				Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 1);
-				f.pc = pc + oplen;
-				pushRet(f, r, ret);
+				hostInvoke(vm, t, f, r, pc, oplen, 1);
 				return;
 			}
 			if (!vm.ensureInit(owner, t))
@@ -288,10 +291,7 @@ public final class Interpreter {
 					f.pc = pc + oplen;
 					return;
 				}
-				Object[] args = popToArray(f, r, true);
-				Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 2);
-				f.pc = pc + oplen;
-				pushRet(f, r, ret);
+				hostInvoke(vm, t, f, r, pc, oplen, 2);
 				return;
 			}
 			// <init> is not inherited — supers walk would run a parent's ctor
@@ -356,10 +356,7 @@ public final class Interpreter {
 						+ " stack:" + st
 						+ chain);
 			}
-			Object[] args = popToArray(f, r, true);
-			Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, 0);
-			f.pc = pc + oplen;
-			pushRet(f, r, ret);
+			hostInvoke(vm, t, f, r, pc, oplen, 0);
 			return;
 		}
 		VmClass rc = ((VmObject) recv).clazz;
@@ -488,6 +485,68 @@ public final class Interpreter {
 		return a;
 	}
 
+	/** popToArray into the caller frame's reusable scratch — safe only for
+	 *  synchronous consumers (resolved fast calls); anything that can park or
+	 *  stash the array must take a private copy instead. */
+	private static Object[] popToScratch(Frame f, ClassFile.Ref r, boolean hasThis) {
+		int n = r.argCount() + (hasThis ? 1 : 0);
+		Object[] a = f.scratch;
+		if (a == null || a.length < n)
+			f.scratch = a = new Object[n];
+		for (int i = n - 1; i >= 0; i--) {
+			Object v = f.stack[--f.sp];
+			if (v == Frame.WIDE)
+				v = f.stack[--f.sp];
+			a[i] = v;
+		}
+		return a;
+	}
+
+	/**
+	 * Host-class invoke with a per-Ref cached fast path. The first call goes
+	 * through the full {@link HostBridge#call dispatch}; {@link HostBridge#resolveFast}
+	 * then caches a builtin/adapter lambda on the Ref, so later calls on this
+	 * site skip the owner switches, parkedCall/fastCall key concats and map
+	 * lookups — stream-heavy games sit inside per-byte read loops where that
+	 * dispatch (and its string allocations) dominated both latency and GC churn.
+	 */
+	private static void hostInvoke(Vm vm, VmThread t, Frame f, ClassFile.Ref r,
+			int pc, int oplen, int kind) {
+		HostBridge.ResolvedCall hf = r.hostFast;
+		boolean thisArg = kind != 1;
+		if (hf != null && hf != HostBridge.NONE) {
+			Object[] args = popToScratch(f, r, thisArg);
+			Object ret;
+			try {
+				ret = hf.invoke(t, args);
+			} catch (VmError | VmException e) {
+				throw e;
+			} catch (Throwable e) {
+				throw new VmException(e);
+			}
+			if (ret != HostBridge.BuiltinMarker.NOT_HANDLED) {
+				f.pc = pc + oplen;
+				pushRet(f, r, Vm.fromHost(ret, !r.retRef()));
+				return;
+			}
+			// shape the resolved path doesn't cover (Object.* semantics, a
+			// receiver subtype outside the builtin's cast...) — full dispatch;
+			// private copy since callParked may outlive this call while a later
+			// invoke is already reusing the scratch array
+			ret = vm.bridge.call(t, r.owner, r.name, r.desc,
+					java.util.Arrays.copyOf(args, r.argCount() + (thisArg ? 1 : 0)), kind);
+			f.pc = pc + oplen;
+			pushRet(f, r, ret);
+			return;
+		}
+		Object[] args = popToArray(f, r, thisArg);
+		Object ret = vm.bridge.call(t, r.owner, r.name, r.desc, args, kind);
+		if (hf == null)
+			r.hostFast = vm.bridge.resolveFast(r.owner, r.name, r.desc, kind);
+		f.pc = pc + oplen;
+		pushRet(f, r, ret);
+	}
+
 	private static void replaceMarker(VmThread t, HostBridge.NewMarker mk, Object built) {
 		for (Frame f : t.frames) {
 			for (int i = 0; i < f.sp; i++)
@@ -537,6 +596,13 @@ public final class Interpreter {
 			if (v == Frame.WIDE)
 				v = f.stack[--f.sp];
 			decl.statics[slot] = v;
+			if (r.watchA == 0)
+				r.watchA = (byte) (decl.name.equals("e")
+						? r.name.equals("aL") ? 1 : r.name.equals("N") ? 3 : 2 : 2);
+			if (r.watchA == 1)
+				vm.watchS = (short[]) v;
+			else if (r.watchA == 3)
+				vm.watchN = (short[]) v;
 		} else {
 			f.stack[f.sp++] = decl.statics[slot];
 			if (VmClass.isWide(r.desc))
@@ -653,6 +719,13 @@ public final class Interpreter {
 		return traceArgsPattern.matcher(sig).matches();
 	}
 
+	// One frame spending this many TOTAL ops at top-of-stack is a runaway
+	// guest loop (the 时空旅者 aL-cycle wedge spins in the draw-list walk —
+	// legit frames return in <~1M ops). Tracked per-Frame, not per-step,
+	// because round-robin slices reset step() counters mid-wedge.
+	// Non-final: tests lower it to verify the unwind without burning 500M ops.
+	static volatile int RUNAWAY_OPS = 500_000_000;
+
 	private static int step(Vm vm, VmThread t, Frame f, int remaining, int depth) {
 		byte[] code = f.method.code.code;
 		ClassFile cf = f.owner.cf;
@@ -665,6 +738,14 @@ public final class Interpreter {
 			f.pc = pc; f.sp = sp;
 			return used;
 		}
+		// Unbounded slices (EQ runUntilDone): the frame-accounted check in
+		// execute only runs after step returns, which a wedge never does —
+		// so guard inside the dispatch loop too. used can't reach 2^31
+		// before this fires, so int overflow can't skip it.
+		if (used > RUNAWAY_OPS)
+			throw new VmException(new InternalError(
+					"runaway frame " + f.describe()
+							+ " — guest loop " + used + " ops"));
 		int op = code[pc] & 0xff;
 		used++;
 		f.pc = pc; // exception paths + helpers read the current insn pc
@@ -751,8 +832,13 @@ public final class Interpreter {
 			case 0x35: { // saload
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				st[sp++] = arr instanceof short[] ? (int) ((short[]) arr)[idx]
-						: Vm.fromHost(Array.get(arr, idx));
+				if (arr instanceof short[]) {
+					int sv = (int) ((short[]) arr)[idx];
+					if (arr == vm.watchN && vm.watchN != null)
+						vm.nProbe(idx, sv);
+					st[sp++] = sv;
+				} else
+					st[sp++] = Vm.fromHost(Array.get(arr, idx));
 				break;
 			}
 			case 0x2f: { // laload
@@ -848,9 +934,11 @@ public final class Interpreter {
 				Object v = st[--sp];
 				int idx = (Integer) st[--sp];
 				Object arr = st[--sp];
-				if (arr instanceof short[] && v instanceof Integer)
+				if (arr instanceof short[] && v instanceof Integer) {
 					((short[]) arr)[idx] = (short) (int) (Integer) v;
-				else
+					if (arr == vm.watchS && vm.watchS != null)
+						vm.watchProbe(t, f, pc, idx, (Integer) v);
+				} else
 					storeArray(arr, idx, v);
 				break;
 			}

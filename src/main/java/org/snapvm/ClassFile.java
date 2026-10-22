@@ -58,8 +58,12 @@ final class ClassFile {
 		ClassFile.Method cacheMethod;
 		VmClass cacheDecl;
 		Vm.FastCall cacheFast;           // registered host fast-path for the resolved guest method, if any
+		HostBridge.ResolvedCall hostFast; // cached builtin/adapter host-call path for owner.host sites;
+		                                 // first call resolves via bridge.resolveFast, later calls skip the
+		                                 // whole call0 dispatch chain (string concats + map lookups per call)
 		byte traceCallMatch;             // 0 untested, 1 no, 2 yes — TRACE_CALLS is fixed at startup
 		byte traceArgsMatch;             // same, for TRACE_ARGS
+		byte watchA;                     // 0 untested, 1 = e.aL putstatic (debug watch), 2 = other
 
 		int argSlots() {
 			if (argSlots < 0)

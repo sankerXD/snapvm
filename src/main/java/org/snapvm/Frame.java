@@ -17,6 +17,10 @@ final class Frame {
 	                     // operand stack (the caller is mid-instruction and
 	                     // never emitted a completing invoke)
 	Object syncOn;       // monitor acquired for an ACC_SYNCHRONIZED method, or null
+	Object[] scratch;    // reusable args array for cached host-call invokes —
+	                     // per-frame so concurrent green threads never share it
+	long ops;            // cumulative ops spent with this frame at top of stack —
+	                     // runaway guest-loop detection (reset in reset())
 
 	Frame(VmClass owner, ClassFile.Method m) {
 		this.owner = owner;
@@ -35,8 +39,11 @@ final class Frame {
 		fromCall = false;
 		external = false;
 		syncOn = null;
+		ops = 0;
 		java.util.Arrays.fill(locals, null);
 		java.util.Arrays.fill(stack, null);
+		if (scratch != null)
+			java.util.Arrays.fill(scratch, null);
 	}
 
 	String describe() {

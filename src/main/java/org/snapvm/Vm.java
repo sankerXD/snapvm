@@ -509,6 +509,79 @@ public final class Vm {
 		return bos.toByteArray();
 	}
 
+	// ---- runaway-list forensics (debug) ----
+	// Interpreter marks vm.watchS when the e.aL draw-list is (re)assigned by
+	// putstatic; every sastore into it runs watchProbe, which logs the frame +
+	// locals the moment a write closes a cycle (时空旅者 hard-freeze hunt).
+	// watchN + nProbe ring-buffer the e.N traversal reads, dumped on cycle.
+	volatile short[] watchS;
+	volatile short[] watchN;
+	final int[] nTrace = new int[4096];
+	int nTracePos;
+
+	void nProbe(int idx, int val) {
+		nTrace[nTracePos & 4095] = (idx << 16) | (val & 0xffff);
+		nTracePos++;
+	}
+
+	private String nTraceDump() {
+		StringBuilder sb = new StringBuilder("N-trace:");
+		int n = Math.min(nTracePos, 4096);
+		for (int i = 0; i < n; i++) {
+			int e = nTrace[(nTracePos - n + i) & 4095];
+			sb.append(' ').append(e >> 16).append("->").append((short) (e & 0xffff));
+		}
+		return sb.toString();
+	}
+
+	void watchProbe(VmThread t, Frame f, int pc, int idx, int v) {
+		// Only the aL[i2]=i4 write (idx == local 2): the aL[i5]=i2 predecessor
+		// write leaves aL[i2] stale until this store lands, so walking earlier
+		// false-positives. After this write the sorted chain from i1 (local 1)
+		// is internally consistent — a revisit here is real corruption.
+		Object i2o = f.locals.length > 2 ? f.locals[2] : null;
+		Object i1o = f.locals.length > 1 ? f.locals[1] : null;
+		if (!(i2o instanceof Integer) || !(i1o instanceof Integer)
+				|| ((Integer) i2o) != idx)
+			return;
+		short[] a = watchS;
+		java.util.LinkedHashSet<Integer> seen = new java.util.LinkedHashSet<>();
+		StringBuilder chain = new StringBuilder();
+		for (int i = (Integer) i1o, hops = 0; i >= 0 && i < a.length && hops < 600;
+				hops++) {
+			chain.append(' ').append(i);
+			if (!seen.add(i)) {
+				StringBuilder sb = new StringBuilder()
+						.append("aL CYCLE ").append(f.describe())
+						.append(" wrote aL[").append(idx).append("]=").append(v)
+						.append(" locals:");
+				for (int j = 0; j < f.locals.length; j++)
+					sb.append(' ').append(j).append('=').append(f.locals[j]);
+				sb.append("\n  chain:").append(chain);
+				sb.append('\n').append(nTraceDump());
+				System.err.println("SnapVM watch " + sb);
+				return;
+			}
+			i = a[i];
+		}
+	}
+
+	/**
+	 * Debug hook: name|desc -> live value for every static of a loaded guest
+	 * class (empty map for unknown/host classes). Best-effort lock-free read —
+	 * must NOT take execLock: the whole point is inspecting a VM whose
+	 * executor is wedged in a runaway guest loop while holding execLock.
+	 */
+	public java.util.Map<String, Object> staticMap(String className) {
+		VmClass c = classes.get(className.replace('.', '/'));
+		if (c == null || c.statics == null)
+			return java.util.Collections.emptyMap();
+		java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+		for (java.util.Map.Entry<String, Integer> e : c.staticFieldSlots.entrySet())
+			m.put(e.getKey(), c.statics[e.getValue()]);
+		return m;
+	}
+
 	/** resolve "java/lang/Object" or "[I" or "java.lang.Object" style names. */
 	public VmClass resolveClass(String name) {
 		name = name.replace('.', '/');

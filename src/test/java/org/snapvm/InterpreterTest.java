@@ -343,6 +343,37 @@ assertEquals(33, run(vm, "D2X2", "go"));
 	}
 
 	/**
+	 * A frame looping forever in one step() call must unwind at
+	 * {@link Interpreter#RUNAWAY_OPS} as a guest-visible throwable — not
+	 * escape and kill the executor thread. The 时空旅者 aL-cycle wedges the
+	 * paint walk forever; this proves the guard fires and the error path is
+	 * the normal unwind (surfaces via invokeStatic's lastError).
+	 */
+	@Test
+	public void runawayFrameUnwinds() throws Exception {
+		int saved = Interpreter.RUNAWAY_OPS;
+		Interpreter.RUNAWAY_OPS = 20_000;
+		try {
+			Vm vm = vm(compile(
+					"public class Rw { public static int go() { int i = 0; "
+							+ "for (;;) i++; } }"));
+			try {
+				vm.invokeStatic("Rw", "go", "()I");
+				fail("runaway frame must not complete");
+			} catch (VmError | VmException expected) {
+				// the InternalError unwound out of the dead frame chain
+				assertTrue(String.valueOf(expected).contains("InternalError"));
+			}
+			// the VM itself must still be usable — executor thread untouched
+			Vm vm2 = vm(compile(
+					"public class Ok { public static int go() { return 7; } }"));
+			assertEquals(7, run(vm2, "Ok", "go"));
+		} finally {
+			Interpreter.RUNAWAY_OPS = saved;
+		}
+	}
+
+	/**
 	 * A guest thread busy-spinning without ever blocking must not starve
 	 * threads scheduled after it. Silent Hill 3's render loop spins on
 	 * Canvas.isShown() with no sleep; first-runnable-wins scheduling then
